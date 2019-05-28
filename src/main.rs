@@ -1,4 +1,5 @@
 use arrayvec::ArrayVec;
+use sodiumoxide::crypto::secretbox;
 use std::convert::TryInto;
 
 #[derive(structopt::StructOpt)]
@@ -47,11 +48,25 @@ where
     }
 }
 
+fn write_framed(w: &mut impl std::io::Write, message: &[u8], key: &secretbox::Key) {
+    let mut framer = MessageFramer::frame(&message);
+    while let Some(frame) = framer.next() {
+        let mut write_buffer = [0u8; 296];
+        let nonce = secretbox::gen_nonce();
+        write_buffer[..24].copy_from_slice(&nonce.0);
+        write_buffer[24..][..256].copy_from_slice(&frame[..256]);
+        let tag = secretbox::seal_detached(&mut write_buffer[24..][..256], &nonce, &key);
+        write_buffer[24..][256..].copy_from_slice(&tag.0);
+        std::io::Write::write_all(w, &write_buffer).unwrap();
+    }
+}
+
 fn main() {
     let result = sodiumoxide::init();
     fatal(&result, "Failed to initialize sodumoxide");
     env_logger::init();
     let args = <Config as structopt::StructOpt>::from_args();
+    let key = secretbox::Key::from_slice(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(); // Placeholder
     match &args.mode {
         Mode::Server => {
             let listener = std::net::TcpListener::bind("127.0.0.1:2600");
@@ -61,10 +76,12 @@ fn main() {
             fatal(&accept_result, "Failed to accept");
             let (mut connection, addr) = accept_result.unwrap();
             log::info!("Accepted connection from {}", addr);
-            let mut read_buffer = [0u8; 1024];
+            let mut read_buffer = [0u8; 296];
+            let mut read_cursor: usize = 0;
             let mut parse_buffer: ArrayVec<[u8; 16384]> = ArrayVec::new();
             loop {
-                let read_result = std::io::Read::read(&mut connection, &mut read_buffer);
+                let read_result =
+                    std::io::Read::read(&mut connection, &mut read_buffer[read_cursor..]);
                 fatal(&read_result, "Failed to read");
                 let read_amount = read_result.unwrap();
                 if read_amount == 0 {
@@ -72,7 +89,19 @@ fn main() {
                     break;
                 }
                 log::info!("Read {}", read_amount);
-                parse_buffer.extend(read_buffer[..read_amount].iter().cloned());
+                read_cursor = read_cursor.checked_add(read_amount).unwrap();
+                if read_cursor != 296 {
+                    continue;
+                }
+                read_cursor = 0;
+
+                let nonce = secretbox::Nonce::from_slice(&read_buffer[..24]).unwrap();
+                let tag = secretbox::Tag::from_slice(&read_buffer[24..][256..]).unwrap();
+                secretbox::open_detached(&mut read_buffer[24..][..256], &tag, &nonce, &key)
+                    .unwrap();
+                let amt: usize = read_buffer[24].into();
+
+                parse_buffer.extend(read_buffer[24..][1..][..amt].iter().cloned());
                 loop {
                     let mut cursor = std::io::Cursor::new(&parse_buffer[..]);
                     let parse_result = serde_cbor::from_reader::<Message, _>(&mut cursor);
@@ -91,9 +120,8 @@ fn main() {
                                     let message = Message::Output {
                                         output: message_output,
                                     };
-                                    serde_cbor::to_writer(&mut connection, &message).unwrap();
-                                    std::io::Write::flush(&mut connection).unwrap();
-                                    log::debug!("Response sent.");
+                                    let message = serde_cbor::to_vec(&message).unwrap();
+                                    write_framed(&mut connection, &message, &key);
                                 }
                                 _ => {
                                     log::error!("Invalid message: {:?}", val);
@@ -125,21 +153,43 @@ fn main() {
                         let mut command = ArrayVec::new();
                         command.extend(input.as_bytes().iter().cloned());
                         let message = Message::Command { command };
-                        let result = serde_cbor::to_writer(&mut connection, &message);
+                        let message = serde_cbor::to_vec(&message).unwrap();
+                        write_framed(&mut connection, &message, &key);
                         fatal(&result, "Failed to write");
                         log::debug!("Message sent successfully.");
-                        let mut read_len = 0;
-                        let mut read_buffer = [0u8; std::mem::size_of::<Message>()];
+                        let mut parse_buffer: ArrayVec<[u8; 16384]> = ArrayVec::new();
+                        let mut read_buffer = [0u8; 296];
+                        let mut read_cursor = 0;
                         loop {
-                            let len =
-                                std::io::Read::read(&mut connection, &mut read_buffer[read_len..])
-                                    .unwrap();
+                            let len = std::io::Read::read(
+                                &mut connection,
+                                &mut read_buffer[read_cursor..],
+                            )
+                            .unwrap();
                             if len == 0 {
                                 log::debug!("Ran out of buffer space or connection lost.");
                                 break;
                             }
-                            read_len = read_len.checked_add(len).unwrap();
-                            let response = serde_cbor::from_slice(&read_buffer[..read_len]);
+                            read_cursor = read_cursor.checked_add(len).unwrap();
+                            if read_cursor < 296 {
+                                continue;
+                            }
+                            read_cursor = 0;
+                            let nonce = secretbox::Nonce::from_slice(&read_buffer[..24]).unwrap();
+                            let tag =
+                                secretbox::Tag::from_slice(&read_buffer[24..][256..]).unwrap();
+                            secretbox::open_detached(
+                                &mut read_buffer[24..][..256],
+                                &tag,
+                                &nonce,
+                                &key,
+                            )
+                            .unwrap();
+                            let amt: usize = read_buffer[24].into();
+
+                            parse_buffer.extend(read_buffer[24..][1..][..amt].iter().cloned());
+
+                            let response = serde_cbor::from_slice(&parse_buffer);
                             if response.is_ok() {
                                 let response = response.unwrap();
                                 match response {
@@ -163,4 +213,69 @@ fn main() {
             }
         }
     }
+}
+
+struct MessageFramer<'a> {
+    input: &'a [u8],
+    working_buffer: [u8; 272],
+    offset: usize,
+}
+
+impl MessageFramer<'_> {
+    fn frame<'a>(input: &'a [u8]) -> MessageFramer<'a> {
+        MessageFramer {
+            input,
+            working_buffer: [0u8; 272],
+            offset: 0,
+        }
+    }
+}
+
+impl<'a> MessageFramer<'a> {
+    fn next(&mut self) -> Option<&mut [u8]> {
+        let remaining = self.input.len().checked_sub(self.offset).unwrap();
+        if remaining == 0 {
+            return None;
+        }
+        let amt = remaining.try_into().unwrap_or(255);
+        self.working_buffer[0] = amt;
+        let amt: usize = amt.into();
+        let end = self.offset + amt;
+        log::trace!(
+            "MessageFramer: Remaining: {}, offset: {}, amt: {}",
+            remaining,
+            self.offset,
+            amt
+        );
+        self.working_buffer[1..][..amt].copy_from_slice(&self.input[self.offset..end]);
+        self.offset = self.offset.checked_add(amt).unwrap();
+        Some(&mut self.working_buffer[..])
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn message_framer_basic() {
+    let a = b"asdf";
+    let mut framer = MessageFramer::frame(a);
+    let frame = framer.next().unwrap();
+    assert_eq!(4, frame[0]);
+    assert_eq!(b"asdf"[..], frame[1..5]);
+    assert!(framer.next().is_none());
+
+    let mut a = Vec::new();
+    for _ in 0..250 {
+        a.extend(b"asdf");
+    }
+    let mut framer = MessageFramer::frame(&a);
+    let frame = framer.next().unwrap();
+    assert_eq!(255, frame[0]);
+    assert_eq!(b'a', frame[1]);
+    let frame = framer.next().unwrap();
+    assert_eq!(255, frame[0]);
+    assert_eq!(b'f', frame[1]);
+    let _ = framer.next().unwrap();
+    let frame = framer.next().unwrap();
+    assert_eq!(235, frame[0]);
+    assert!(framer.next().is_none());
 }
