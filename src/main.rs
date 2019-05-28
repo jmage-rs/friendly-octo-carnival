@@ -34,32 +34,38 @@ enum Message {
     Output { output: ArrayVec<[u8; 8192]> },
 }
 
+fn fatal<T, E>(result: &Result<T, E>, msg: &str)
+where
+    E: std::fmt::Debug,
+{
+    match result {
+        Err(err) => {
+            log::error!("{}: {:?}", msg, err);
+            std::process::exit(1);
+        }
+        _ => (),
+    }
+}
+
 fn main() {
+    let result = sodiumoxide::init();
+    fatal(&result, "Failed to initialize sodumoxide");
     env_logger::init();
     let args = <Config as structopt::StructOpt>::from_args();
     match &args.mode {
         Mode::Server => {
             let listener = std::net::TcpListener::bind("127.0.0.1:2600");
-            if listener.is_err() {
-                log::error!("Failed to bind: {}", listener.unwrap_err());
-                std::process::exit(1);
-            }
+            fatal(&listener, "Failed to bind");
             let listener = listener.unwrap();
             let accept_result = listener.accept();
-            if accept_result.is_err() {
-                log::error!("Failed to accept: {}", accept_result.unwrap_err());
-                std::process::exit(1);
-            }
+            fatal(&accept_result, "Failed to accept");
             let (mut connection, addr) = accept_result.unwrap();
             log::info!("Accepted connection from {}", addr);
             let mut read_buffer = [0u8; 1024];
             let mut parse_buffer: ArrayVec<[u8; 16384]> = ArrayVec::new();
             loop {
                 let read_result = std::io::Read::read(&mut connection, &mut read_buffer);
-                if read_result.is_err() {
-                    log::error!("Failed to read: {}", read_result.unwrap_err());
-                    std::process::exit(1);
-                }
+                fatal(&read_result, "Failed to read");
                 let read_amount = read_result.unwrap();
                 if read_amount == 0 {
                     log::info!("Disconnected");
@@ -107,20 +113,10 @@ fn main() {
         }
         Mode::Client => {
             let connection = std::net::TcpStream::connect("127.0.0.1:2600");
-            if connection.is_err() {
-                log::error!("Failed to connect: {}", connection.unwrap_err());
-                std::process::exit(1);
-            }
+            fatal(&connection, "Failed to connect");
             let mut connection = connection.unwrap();
             let interface = linefeed::Interface::new("oxy");
-            if interface.is_err() {
-                let error = match interface {
-                    Err(err) => err,
-                    _ => unreachable!(),
-                }; // unwrap_err doesn't work here? :(
-                log::error!("Failed to create linefeed interface: {:?}", error);
-                std::process::exit(1);
-            }
+            fatal(&interface, "Failed to create linefeed interface");
             let interface = interface.unwrap();
             let _ = interface.set_prompt("oxy> ");
             loop {
@@ -130,10 +126,7 @@ fn main() {
                         command.extend(input.as_bytes().iter().cloned());
                         let message = Message::Command { command };
                         let result = serde_cbor::to_writer(&mut connection, &message);
-                        if result.is_err() {
-                            log::error!("Failed to write: {}", result.unwrap_err());
-                            std::process::exit(1);
-                        }
+                        fatal(&result, "Failed to write");
                         log::debug!("Message sent successfully.");
                         let mut read_len = 0;
                         let mut read_buffer = [0u8; std::mem::size_of::<Message>()];
