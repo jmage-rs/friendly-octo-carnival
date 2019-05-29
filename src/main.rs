@@ -72,71 +72,81 @@ fn main() {
             let listener = std::net::TcpListener::bind("127.0.0.1:2600");
             fatal(&listener, "Failed to bind");
             let listener = listener.unwrap();
-            let accept_result = listener.accept();
-            fatal(&accept_result, "Failed to accept");
-            let (mut connection, addr) = accept_result.unwrap();
-            log::info!("Accepted connection from {}", addr);
-            let mut read_buffer = [0u8; 296];
-            let mut read_cursor: usize = 0;
-            let mut parse_buffer: ArrayVec<[u8; 16384]> = ArrayVec::new();
             loop {
-                let read_result =
-                    std::io::Read::read(&mut connection, &mut read_buffer[read_cursor..]);
-                fatal(&read_result, "Failed to read");
-                let read_amount = read_result.unwrap();
-                if read_amount == 0 {
-                    log::info!("Disconnected");
-                    break;
-                }
-                log::info!("Read {}", read_amount);
-                read_cursor = read_cursor.checked_add(read_amount).unwrap();
-                if read_cursor != 296 {
+                let accept_result = listener.accept();
+                if accept_result.is_err() {
+                    log::error!("Error during accept(): {}", accept_result.unwrap_err());
                     continue;
                 }
-                read_cursor = 0;
-
-                let nonce = secretbox::Nonce::from_slice(&read_buffer[..24]).unwrap();
-                let tag = secretbox::Tag::from_slice(&read_buffer[24..][256..]).unwrap();
-                secretbox::open_detached(&mut read_buffer[24..][..256], &tag, &nonce, &key)
-                    .unwrap();
-                let amt: usize = read_buffer[24].into();
-
-                parse_buffer.extend(read_buffer[24..][1..][..amt].iter().cloned());
-                loop {
-                    let mut cursor = std::io::Cursor::new(&parse_buffer[..]);
-                    let parse_result = serde_cbor::from_reader::<Message, _>(&mut cursor);
-                    match parse_result {
-                        Ok(val) => {
-                            match val {
-                                Message::Command { command } => {
-                                    let cmd_str = std::str::from_utf8(&command[..]).unwrap();
-                                    let output = std::process::Command::new("sh")
-                                        .arg("-c")
-                                        .arg(cmd_str)
-                                        .output()
-                                        .unwrap();
-                                    let mut message_output = ArrayVec::new();
-                                    message_output.extend(output.stdout);
-                                    let message = Message::Output {
-                                        output: message_output,
-                                    };
-                                    let message = serde_cbor::to_vec(&message).unwrap();
-                                    write_framed(&mut connection, &message, &key);
-                                }
-                                _ => {
-                                    log::error!("Invalid message: {:?}", val);
-                                    std::process::exit(1);
-                                }
-                            }
-                            let consumed: usize = cursor.position().try_into().unwrap();
-                            parse_buffer.drain(0..consumed);
-                        }
-                        Err(err) => {
-                            log::debug!("CBOR parse error: {:?}", err);
+                let (mut connection, addr) = accept_result.unwrap();
+                let key2 = key.clone();
+                std::thread::spawn(move || {
+                    let key = key2;
+                    log::info!("Accepted connection from {}", addr);
+                    let mut read_buffer = [0u8; 296];
+                    let mut read_cursor: usize = 0;
+                    let mut parse_buffer: ArrayVec<[u8; 16384]> = ArrayVec::new();
+                    loop {
+                        let read_result =
+                            std::io::Read::read(&mut connection, &mut read_buffer[read_cursor..]);
+                        fatal(&read_result, "Failed to read");
+                        let read_amount = read_result.unwrap();
+                        if read_amount == 0 {
+                            log::info!("Disconnected");
                             break;
                         }
+                        log::info!("Read {}", read_amount);
+                        read_cursor = read_cursor.checked_add(read_amount).unwrap();
+                        if read_cursor != 296 {
+                            continue;
+                        }
+                        read_cursor = 0;
+
+                        let nonce = secretbox::Nonce::from_slice(&read_buffer[..24]).unwrap();
+                        let tag = secretbox::Tag::from_slice(&read_buffer[24..][256..]).unwrap();
+                        secretbox::open_detached(&mut read_buffer[24..][..256], &tag, &nonce, &key)
+                            .unwrap();
+                        let amt: usize = read_buffer[24].into();
+
+                        parse_buffer.extend(read_buffer[24..][1..][..amt].iter().cloned());
+                        loop {
+                            let mut cursor = std::io::Cursor::new(&parse_buffer[..]);
+                            let parse_result = serde_cbor::from_reader::<Message, _>(&mut cursor);
+                            match parse_result {
+                                Ok(val) => {
+                                    match val {
+                                        Message::Command { command } => {
+                                            let cmd_str =
+                                                std::str::from_utf8(&command[..]).unwrap();
+                                            let output = std::process::Command::new("sh")
+                                                .arg("-c")
+                                                .arg(cmd_str)
+                                                .output()
+                                                .unwrap();
+                                            let mut message_output = ArrayVec::new();
+                                            message_output.extend(output.stdout);
+                                            let message = Message::Output {
+                                                output: message_output,
+                                            };
+                                            let message = serde_cbor::to_vec(&message).unwrap();
+                                            write_framed(&mut connection, &message, &key);
+                                        }
+                                        _ => {
+                                            log::error!("Invalid message: {:?}", val);
+                                            std::process::exit(1);
+                                        }
+                                    }
+                                    let consumed: usize = cursor.position().try_into().unwrap();
+                                    parse_buffer.drain(0..consumed);
+                                }
+                                Err(err) => {
+                                    log::debug!("CBOR parse error: {:?}", err);
+                                    break;
+                                }
+                            }
+                        }
                     }
-                }
+                });
             }
         }
         Mode::Client => {
