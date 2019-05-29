@@ -1,4 +1,5 @@
 use arrayvec::ArrayVec;
+use sodiumoxide::crypto::pwhash::argon2id13;
 use sodiumoxide::crypto::secretbox;
 use std::convert::TryInto;
 
@@ -6,6 +7,12 @@ use std::convert::TryInto;
 struct Config {
     #[structopt(long = "mode")]
     mode: Mode,
+    #[structopt(long = "bind-addr")]
+    bind_addr: Option<std::net::SocketAddr>,
+    #[structopt(long = "destination")]
+    destination: Option<String>,
+    #[structopt(long = "password")]
+    password: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,10 +73,26 @@ fn main() {
     fatal(&result, "Failed to initialize sodumoxide");
     env_logger::init();
     let args = <Config as structopt::StructOpt>::from_args();
-    let key = secretbox::Key::from_slice(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(); // Placeholder
+    let salt =
+        argon2id13::Salt::from_slice(b"i7'\xe0\xf0\xe6\xc0\xb2\xf9V\x1b\xe4\xc8\xb6\x95\x07")
+            .unwrap();
+    let mut key_buffer = [0u8; 32];
+    let key_bytes = argon2id13::derive_key(
+        &mut key_buffer[..],
+        args.password.as_ref().unwrap().as_bytes(),
+        &salt,
+        argon2id13::OPSLIMIT_INTERACTIVE,
+        argon2id13::MEMLIMIT_INTERACTIVE,
+    )
+    .unwrap();
+    let key = secretbox::Key::from_slice(key_bytes).unwrap();
     match &args.mode {
         Mode::Server => {
-            let listener = std::net::TcpListener::bind("127.0.0.1:2600");
+            let listener = std::net::TcpListener::bind(
+                args.bind_addr
+                    .as_ref()
+                    .unwrap_or(&"127.0.0.1:2600".parse().unwrap()),
+            );
             fatal(&listener, "Failed to bind");
             let listener = listener.unwrap();
             loop {
@@ -150,7 +173,12 @@ fn main() {
             }
         }
         Mode::Client => {
-            let connection = std::net::TcpStream::connect("127.0.0.1:2600");
+            let dest = args
+                .destination
+                .as_ref()
+                .map(|x| x.as_str())
+                .unwrap_or("127.0.0.1:2600");
+            let connection = std::net::TcpStream::connect(dest);
             fatal(&connection, "Failed to connect");
             let mut connection = connection.unwrap();
             let interface = linefeed::Interface::new("oxy");
