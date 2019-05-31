@@ -15,7 +15,7 @@ struct Config {
     password: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
     Server,
     Client,
@@ -78,6 +78,7 @@ struct Oxy {
     config: Config,
     key: secretbox::Key,
     done: bool,
+    waiting_for_output: bool,
 }
 
 enum RecvConnectionResult {
@@ -190,7 +191,11 @@ impl Oxy {
             },
             Message::Output { output } => match &self.config.mode {
                 Mode::Client => {
-                    ();
+                    let stdout = std::io::stdout();
+                    let mut stdout_lock = stdout.lock();
+                    std::io::Write::write_all(&mut stdout_lock, &output).unwrap();
+                    std::io::Write::flush(&mut stdout_lock).unwrap();
+                    self.waiting_for_output = false;
                 }
                 Mode::Server => {
                     log::warn!("Client sent server command output");
@@ -234,6 +239,27 @@ impl Oxy {
         }
     }
 
+    fn readline(&mut self) {
+        let interface = linefeed::Interface::new("oxy");
+        fatal(&interface, "Failed to create linefeed interface");
+        let interface = interface.unwrap();
+        let _ = interface.set_prompt("oxy> ");
+        match interface.read_line() {
+            Ok(linefeed::ReadResult::Input(input)) => {
+                let mut command = ArrayVec::new();
+                command.extend(input.as_bytes().iter().cloned());
+                let message = Message::Command { command };
+                let message = serde_cbor::to_vec(&message).unwrap();
+                write_framed(&mut self.connection, &message, &self.key);
+                log::debug!("Message sent successfully.");
+                self.waiting_for_output = true;
+            }
+            _ => {
+                self.done = true;
+            }
+        }
+    }
+
     fn run(&mut self) {
         let poll = mio::Poll::new().unwrap();
         poll.register(
@@ -246,6 +272,13 @@ impl Oxy {
         let mut events = mio::Events::with_capacity(1024);
 
         loop {
+            if self.config.mode == Mode::Client && !self.waiting_for_output {
+                self.readline();
+                if self.done {
+                    break;
+                }
+            }
+
             poll.poll(&mut events, None).unwrap();
             for event in &events {
                 self.handle_event(event);
@@ -314,6 +347,7 @@ fn main() {
                         connection,
                         config: args,
                         done: false,
+                        waiting_for_output: false,
                     };
                     oxy.run();
                 });
@@ -327,75 +361,19 @@ fn main() {
                 .unwrap_or("127.0.0.1:2600");
             let connection = std::net::TcpStream::connect(dest);
             fatal(&connection, "Failed to connect");
-            let mut connection = connection.unwrap();
-            let interface = linefeed::Interface::new("oxy");
-            fatal(&interface, "Failed to create linefeed interface");
-            let interface = interface.unwrap();
-            let _ = interface.set_prompt("oxy> ");
-            loop {
-                match interface.read_line() {
-                    Ok(linefeed::ReadResult::Input(input)) => {
-                        let mut command = ArrayVec::new();
-                        command.extend(input.as_bytes().iter().cloned());
-                        let message = Message::Command { command };
-                        let message = serde_cbor::to_vec(&message).unwrap();
-                        write_framed(&mut connection, &message, &key);
-                        fatal(&result, "Failed to write");
-                        log::debug!("Message sent successfully.");
-                        let mut parse_buffer: ArrayVec<[u8; 16384]> = ArrayVec::new();
-                        let mut read_buffer = [0u8; 296];
-                        let mut read_cursor = 0;
-                        loop {
-                            let len = std::io::Read::read(
-                                &mut connection,
-                                &mut read_buffer[read_cursor..],
-                            )
-                            .unwrap();
-                            if len == 0 {
-                                log::debug!("Ran out of buffer space or connection lost.");
-                                break;
-                            }
-                            read_cursor = read_cursor.checked_add(len).unwrap();
-                            if read_cursor < 296 {
-                                continue;
-                            }
-                            read_cursor = 0;
-                            let nonce = secretbox::Nonce::from_slice(&read_buffer[..24]).unwrap();
-                            let tag =
-                                secretbox::Tag::from_slice(&read_buffer[24..][256..]).unwrap();
-                            secretbox::open_detached(
-                                &mut read_buffer[24..][..256],
-                                &tag,
-                                &nonce,
-                                &key,
-                            )
-                            .unwrap();
-                            let amt: usize = read_buffer[24].into();
-
-                            parse_buffer.extend(read_buffer[24..][1..][..amt].iter().cloned());
-
-                            let response = serde_cbor::from_slice(&parse_buffer);
-                            if response.is_ok() {
-                                let response = response.unwrap();
-                                match response {
-                                    Message::Output { output } => {
-                                        let stdout = std::io::stdout();
-                                        let mut stdout_lock = stdout.lock();
-                                        std::io::Write::write_all(&mut stdout_lock, &output)
-                                            .unwrap();
-                                        std::io::Write::flush(&mut stdout_lock).unwrap();
-                                    }
-                                    _ => panic!("Invalid response"),
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    _ => {
-                        break;
-                    }
-                }
-            }
+            let connection = connection.unwrap();
+            let connection = mio::net::TcpStream::from_stream(connection).unwrap();
+            let mut oxy = Oxy {
+                recv_buffer: [0u8; 296],
+                recv_cursor: 0,
+                key,
+                message_buffer: ArrayVec::new(),
+                connection,
+                config: args,
+                done: false,
+                waiting_for_output: false,
+            };
+            oxy.run();
         }
     }
 }
