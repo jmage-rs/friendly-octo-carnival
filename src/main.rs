@@ -3,7 +3,7 @@ use sodiumoxide::crypto::pwhash::argon2id13;
 use sodiumoxide::crypto::secretbox;
 use std::convert::TryInto;
 
-#[derive(structopt::StructOpt)]
+#[derive(structopt::StructOpt, Clone)]
 struct Config {
     #[structopt(long = "mode")]
     mode: Mode,
@@ -68,6 +68,196 @@ fn write_framed(w: &mut impl std::io::Write, message: &[u8], key: &secretbox::Ke
     }
 }
 
+const CONNECTION_TOKEN: mio::Token = mio::Token(0);
+
+struct Oxy {
+    connection: mio::net::TcpStream,
+    recv_buffer: [u8; 296],
+    recv_cursor: usize,
+    message_buffer: ArrayVec<[u8; 16384]>,
+    config: Config,
+    key: secretbox::Key,
+    done: bool,
+}
+
+enum RecvConnectionResult {
+    Full,
+    WouldBlock,
+    KeepGoing,
+    Disconnected,
+}
+
+impl Oxy {
+    fn recv_connection_single(&mut self) -> std::io::Result<RecvConnectionResult> {
+        debug_assert!(self.recv_buffer[self.recv_cursor..].len() != 0);
+        let result = std::io::Read::read(
+            &mut self.connection,
+            &mut self.recv_buffer[self.recv_cursor..],
+        );
+        match result {
+            Ok(amt) => {
+                log::info!("Read {}", amt);
+                if amt == 0 {
+                    log::info!("Disconnected");
+                    return Ok(RecvConnectionResult::Disconnected);
+                }
+                self.recv_cursor = self.recv_cursor.checked_add(amt).unwrap();
+                if self.recv_cursor > 296 {
+                    panic!("That shouldn't happen");
+                } else if self.recv_cursor == 296 {
+                    return Ok(RecvConnectionResult::Full);
+                } else {
+                    return Ok(RecvConnectionResult::KeepGoing);
+                }
+            }
+            Err(err) => {
+                let kind = err.kind();
+                if kind == std::io::ErrorKind::WouldBlock {
+                    return Ok(RecvConnectionResult::WouldBlock);
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    fn recv_connection_multi(&mut self) -> std::io::Result<RecvConnectionResult> {
+        loop {
+            let result = self.recv_connection_single();
+            match result {
+                Ok(RecvConnectionResult::KeepGoing) => {
+                    continue;
+                }
+                result => {
+                    return result;
+                }
+            }
+        }
+    }
+
+    fn consume_connection_frame(&mut self) {
+        self.decrypt_message_frame();
+        self.try_parse_message();
+    }
+
+    fn decrypt_message_frame(&mut self) {
+        let nonce = secretbox::Nonce::from_slice(&self.recv_buffer[..24]).unwrap();
+        let tag = secretbox::Tag::from_slice(&self.recv_buffer[24..][256..]).unwrap();
+        secretbox::open_detached(&mut self.recv_buffer[24..][..256], &tag, &nonce, &self.key)
+            .unwrap();
+        let amt: usize = self.recv_buffer[24].into();
+
+        self.message_buffer
+            .extend(self.recv_buffer[24..][1..][..amt].iter().cloned());
+        self.recv_cursor = 0;
+    }
+
+    fn try_parse_message(&mut self) {
+        let mut cursor = std::io::Cursor::new(&self.message_buffer[..]);
+        let parse_result = serde_cbor::from_reader::<Message, _>(&mut cursor);
+        match parse_result {
+            Ok(val) => {
+                let consumed: usize = cursor.position().try_into().unwrap();
+                self.message_buffer.drain(0..consumed);
+                self.handle_message(&val);
+            }
+            Err(err) => {
+                log::debug!("CBOR parse error: {:?}", err);
+            }
+        }
+    }
+
+    fn handle_message(&mut self, message: &Message) {
+        match message {
+            Message::Command { command } => match &self.config.mode {
+                Mode::Server => {
+                    let cmd_str = std::str::from_utf8(&command[..]).unwrap();
+                    let output = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(cmd_str)
+                        .output()
+                        .unwrap();
+                    let mut message_output = ArrayVec::new();
+                    message_output.extend(output.stdout);
+                    let message = Message::Output {
+                        output: message_output,
+                    };
+                    let message = serde_cbor::to_vec(&message).unwrap();
+                    write_framed(&mut self.connection, &message, &self.key);
+                }
+                Mode::Client => {
+                    log::warn!("Server tried to get client to execute command.");
+                }
+            },
+            Message::Output { output } => match &self.config.mode {
+                Mode::Client => {
+                    ();
+                }
+                Mode::Server => {
+                    log::warn!("Client sent server command output");
+                }
+            },
+        }
+    }
+
+    fn pump_connection(&mut self) {
+        loop {
+            match self.recv_connection_multi() {
+                Ok(RecvConnectionResult::Full) => {
+                    self.consume_connection_frame();
+                }
+                Ok(RecvConnectionResult::WouldBlock) => {
+                    break;
+                }
+                Ok(RecvConnectionResult::KeepGoing) => {
+                    unreachable!();
+                }
+                Ok(RecvConnectionResult::Disconnected) => {
+                    self.done = true;
+                    break;
+                }
+                Err(err) => {
+                    log::warn!("Connection read error: {:?}", err);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn handle_event(&mut self, event: mio::Event) {
+        match event.token() {
+            CONNECTION_TOKEN => {
+                self.pump_connection();
+            }
+            _ => {
+                log::warn!("Event for unknown token: {:?}", event);
+            }
+        }
+    }
+
+    fn run(&mut self) {
+        let poll = mio::Poll::new().unwrap();
+        poll.register(
+            &self.connection,
+            CONNECTION_TOKEN,
+            mio::Ready::readable(),
+            mio::PollOpt::edge(),
+        )
+        .unwrap();
+        let mut events = mio::Events::with_capacity(1024);
+
+        loop {
+            poll.poll(&mut events, None).unwrap();
+            for event in &events {
+                self.handle_event(event);
+            }
+            events.clear();
+            if self.done {
+                break;
+            }
+        }
+    }
+}
+
 fn main() {
     let result = sodiumoxide::init();
     fatal(&result, "Failed to initialize sodumoxide");
@@ -79,7 +269,11 @@ fn main() {
     let mut key_buffer = [0u8; 32];
     let key_bytes = argon2id13::derive_key(
         &mut key_buffer[..],
-        args.password.as_ref().unwrap().as_bytes(),
+        args.password
+            .as_ref()
+            .map(|x| x.as_str())
+            .unwrap_or("")
+            .as_bytes(),
         &salt,
         argon2id13::OPSLIMIT_INTERACTIVE,
         argon2id13::MEMLIMIT_INTERACTIVE,
@@ -101,74 +295,27 @@ fn main() {
                     log::error!("Error during accept(): {}", accept_result.unwrap_err());
                     continue;
                 }
-                let (mut connection, addr) = accept_result.unwrap();
+                let (connection, addr) = accept_result.unwrap();
                 let key2 = key.clone();
+                let args2 = args.clone();
                 std::thread::spawn(move || {
                     let key = key2;
+                    let args = args2;
                     log::info!("Accepted connection from {}", addr);
-                    let mut read_buffer = [0u8; 296];
-                    let mut read_cursor: usize = 0;
-                    let mut parse_buffer: ArrayVec<[u8; 16384]> = ArrayVec::new();
-                    loop {
-                        let read_result =
-                            std::io::Read::read(&mut connection, &mut read_buffer[read_cursor..]);
-                        fatal(&read_result, "Failed to read");
-                        let read_amount = read_result.unwrap();
-                        if read_amount == 0 {
-                            log::info!("Disconnected");
-                            break;
-                        }
-                        log::info!("Read {}", read_amount);
-                        read_cursor = read_cursor.checked_add(read_amount).unwrap();
-                        if read_cursor != 296 {
-                            continue;
-                        }
-                        read_cursor = 0;
-
-                        let nonce = secretbox::Nonce::from_slice(&read_buffer[..24]).unwrap();
-                        let tag = secretbox::Tag::from_slice(&read_buffer[24..][256..]).unwrap();
-                        secretbox::open_detached(&mut read_buffer[24..][..256], &tag, &nonce, &key)
-                            .unwrap();
-                        let amt: usize = read_buffer[24].into();
-
-                        parse_buffer.extend(read_buffer[24..][1..][..amt].iter().cloned());
-                        loop {
-                            let mut cursor = std::io::Cursor::new(&parse_buffer[..]);
-                            let parse_result = serde_cbor::from_reader::<Message, _>(&mut cursor);
-                            match parse_result {
-                                Ok(val) => {
-                                    match val {
-                                        Message::Command { command } => {
-                                            let cmd_str =
-                                                std::str::from_utf8(&command[..]).unwrap();
-                                            let output = std::process::Command::new("sh")
-                                                .arg("-c")
-                                                .arg(cmd_str)
-                                                .output()
-                                                .unwrap();
-                                            let mut message_output = ArrayVec::new();
-                                            message_output.extend(output.stdout);
-                                            let message = Message::Output {
-                                                output: message_output,
-                                            };
-                                            let message = serde_cbor::to_vec(&message).unwrap();
-                                            write_framed(&mut connection, &message, &key);
-                                        }
-                                        _ => {
-                                            log::error!("Invalid message: {:?}", val);
-                                            std::process::exit(1);
-                                        }
-                                    }
-                                    let consumed: usize = cursor.position().try_into().unwrap();
-                                    parse_buffer.drain(0..consumed);
-                                }
-                                Err(err) => {
-                                    log::debug!("CBOR parse error: {:?}", err);
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                    let recv_buffer = [0u8; 296];
+                    let recv_cursor: usize = 0;
+                    let message_buffer: ArrayVec<[u8; 16384]> = ArrayVec::new();
+                    let connection = mio::net::TcpStream::from_stream(connection).unwrap();
+                    let mut oxy = Oxy {
+                        recv_buffer,
+                        recv_cursor,
+                        key,
+                        message_buffer,
+                        connection,
+                        config: args,
+                        done: false,
+                    };
+                    oxy.run();
                 });
             }
         }
