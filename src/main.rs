@@ -2,6 +2,7 @@ use arrayvec::ArrayVec;
 use sodiumoxide::crypto::pwhash::argon2id13;
 use sodiumoxide::crypto::secretbox;
 use std::convert::TryInto;
+use std::sync::Arc;
 
 #[derive(structopt::StructOpt, Clone)]
 struct Config {
@@ -69,6 +70,7 @@ fn write_framed(w: &mut impl std::io::Write, message: &[u8], key: &secretbox::Ke
 }
 
 const CONNECTION_TOKEN: mio::Token = mio::Token(0);
+const READLINE_TOKEN: mio::Token = mio::Token(1);
 
 struct Oxy {
     connection: mio::net::TcpStream,
@@ -78,7 +80,8 @@ struct Oxy {
     config: Config,
     key: secretbox::Key,
     done: bool,
-    waiting_for_output: bool,
+    linefeed_interface: Option<Arc<linefeed::Interface<linefeed::terminal::DefaultTerminal>>>,
+    readline_rx: Option<std::sync::mpsc::Receiver<String>>,
 }
 
 enum RecvConnectionResult {
@@ -191,11 +194,17 @@ impl Oxy {
             },
             Message::Output { output } => match &self.config.mode {
                 Mode::Client => {
-                    let stdout = std::io::stdout();
-                    let mut stdout_lock = stdout.lock();
-                    std::io::Write::write_all(&mut stdout_lock, &output).unwrap();
-                    std::io::Write::flush(&mut stdout_lock).unwrap();
-                    self.waiting_for_output = false;
+                    let mut writer = self
+                        .linefeed_interface
+                        .as_ref()
+                        .unwrap()
+                        .lock_writer_erase()
+                        .unwrap();
+                    let str_output = std::str::from_utf8(output).unwrap_or("[unprintable output]");
+                    writer.write_str(str_output).unwrap();
+                    if *output.iter().last().unwrap_or(&0) != b'\n' {
+                        writer.write_str("\n").unwrap();
+                    }
                 }
                 Mode::Server => {
                     log::warn!("Client sent server command output");
@@ -233,31 +242,53 @@ impl Oxy {
             CONNECTION_TOKEN => {
                 self.pump_connection();
             }
+            READLINE_TOKEN => {
+                while let Ok(input) = self.readline_rx.as_ref().unwrap().try_recv() {
+                    let mut command = ArrayVec::new();
+                    command.extend(input.as_bytes().iter().cloned());
+                    let message = Message::Command { command };
+                    let message = serde_cbor::to_vec(&message).unwrap();
+                    write_framed(&mut self.connection, &message, &self.key);
+                    log::debug!("Message sent successfully.");
+                }
+            }
             _ => {
                 log::warn!("Event for unknown token: {:?}", event);
             }
         }
     }
 
-    fn readline(&mut self) {
+    fn spawn_readline_thread(&mut self, poll: &mio::Poll) {
         let interface = linefeed::Interface::new("oxy");
         fatal(&interface, "Failed to create linefeed interface");
         let interface = interface.unwrap();
         let _ = interface.set_prompt("oxy> ");
-        match interface.read_line() {
-            Ok(linefeed::ReadResult::Input(input)) => {
-                let mut command = ArrayVec::new();
-                command.extend(input.as_bytes().iter().cloned());
-                let message = Message::Command { command };
-                let message = serde_cbor::to_vec(&message).unwrap();
-                write_framed(&mut self.connection, &message, &self.key);
-                log::debug!("Message sent successfully.");
-                self.waiting_for_output = true;
+        let interface = Arc::new(interface);
+        self.linefeed_interface = Some(interface.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.readline_rx = Some(rx);
+        let (registration, set_readiness) = mio::Registration::new2();
+        poll.register(
+            &registration,
+            READLINE_TOKEN,
+            mio::Ready::readable(),
+            mio::PollOpt::edge(),
+        )
+        .unwrap();
+        std::thread::spawn(move || {
+            let _registration = registration; // If we drop it MIO won't deliver events.
+            loop {
+                match interface.read_line() {
+                    Ok(linefeed::ReadResult::Input(input)) => {
+                        tx.send(input).unwrap();
+                        set_readiness.set_readiness(mio::Ready::readable()).unwrap();
+                    }
+                    _ => {
+                        std::process::exit(0);
+                    }
+                };
             }
-            _ => {
-                self.done = true;
-            }
-        }
+        });
     }
 
     fn run(&mut self) {
@@ -271,14 +302,11 @@ impl Oxy {
         .unwrap();
         let mut events = mio::Events::with_capacity(1024);
 
-        loop {
-            if self.config.mode == Mode::Client && !self.waiting_for_output {
-                self.readline();
-                if self.done {
-                    break;
-                }
-            }
+        if self.config.mode == Mode::Client {
+            self.spawn_readline_thread(&poll);
+        }
 
+        loop {
             poll.poll(&mut events, None).unwrap();
             for event in &events {
                 self.handle_event(event);
@@ -347,7 +375,8 @@ fn main() {
                         connection,
                         config: args,
                         done: false,
-                        waiting_for_output: false,
+                        linefeed_interface: None,
+                        readline_rx: None,
                     };
                     oxy.run();
                 });
@@ -371,7 +400,8 @@ fn main() {
                 connection,
                 config: args,
                 done: false,
-                waiting_for_output: false,
+                linefeed_interface: None,
+                readline_rx: None,
             };
             oxy.run();
         }
