@@ -1,8 +1,12 @@
+pub mod message;
+
 use arrayvec::{ArrayString, ArrayVec};
 use sodiumoxide::crypto::pwhash::argon2id13;
 use sodiumoxide::crypto::secretbox;
 use std::convert::{TryFrom, TryInto};
 use std::sync::Arc;
+
+use crate::message::{Message, PortFwdDirection};
 
 #[derive(structopt::StructOpt, Clone)]
 struct Config {
@@ -37,27 +41,6 @@ impl std::str::FromStr for Mode {
     }
 }
 
-#[derive(serde_derive::Serialize, serde_derive::Deserialize, Debug)]
-enum Message {
-    Reject {
-        reference: u64,
-        message: ArrayString<[u8; 8192]>,
-    },
-    Command {
-        command: ArrayVec<[u8; 8192]>,
-    },
-    Output {
-        reference: u64,
-        output: ArrayVec<[u8; 8192]>,
-    },
-    PortFwdBind {
-        addr: std::net::SocketAddr,
-    },
-    PortFwdConnect {
-        reference: u64,
-    },
-}
-
 fn fatal<T, E>(result: &Result<T, E>, msg: &str)
 where
     E: std::fmt::Debug,
@@ -90,6 +73,7 @@ const CATEGORY_BASE: usize = 0x00000000;
 #[deny(overflowing_literals)]
 const CATEGORY_PORTFWD_BIND: usize = 0x01000000;
 const CATEGORY_PORTFWD_ACCEPT: usize = 0x02000000;
+const CATEGORY_PORTFWD_CONNECT: usize = 0x03000000;
 
 struct Oxy {
     connection: mio::net::TcpStream,
@@ -168,6 +152,15 @@ type PortFwdConnect = PortFwdAccept;
 #[derive(Default)]
 struct ClientData {
     linefeed_interface: Option<Arc<linefeed::Interface<linefeed::terminal::DefaultTerminal>>>,
+    remote_portfwd_binds: ArrayVec<[RemotePortFwdBind; 10]>,
+    portfwd_connects: ArrayVec<[PortFwdConnect; 10]>,
+    portfwd_connect_token_ticker: u16,
+}
+
+struct RemotePortFwdBind {
+    reference: u64,
+    lspec: ArrayString<[u8; 256]>,
+    rspec: std::net::SocketAddr,
 }
 
 enum RecvConnectionResult {
@@ -347,12 +340,85 @@ impl Oxy {
             }
             Message::PortFwdConnect { reference } => match &self.config.mode {
                 Mode::Client => {
-                    ();
+                    let data = self
+                        .typedata
+                        .client()
+                        .remote_portfwd_binds
+                        .iter()
+                        .filter(|x| x.reference == *reference)
+                        .next();
+                    if data.is_none() {
+                        log::warn!("PortFwdConnect for unknown portfwd.");
+                        return;
+                    }
+                    let data = data.unwrap();
+                    let dest = std::net::ToSocketAddrs::to_socket_addrs(data.lspec.as_str());
+                    if dest.is_err() {
+                        log::warn!("Failed to resolve lspec {:?}", data.lspec);
+                        self.reject(message_number, "");
+                        return;
+                    }
+                    let mut dest = dest.unwrap();
+                    let dest = dest.next();
+                    if dest.is_none() {
+                        log::warn!("Resolved lspec to no addresses {:?}", data.lspec);
+                        self.reject(message_number, "");
+                        return;
+                    }
+                    if self.typedata.client().portfwd_connects.is_full() {
+                        log::warn!("Too many portfwd connections");
+                        self.reject(message_number, "");
+                        return;
+                    }
+                    let socket = mio::net::TcpStream::connect(&dest.unwrap());
+                    if socket.is_err() {
+                        log::warn!("Error on portfwd connect: {:?}", socket);
+                        self.reject(message_number, "");
+                        return;
+                    }
+                    let socket = socket.unwrap();
+                    let token = self.typedata.client().portfwd_connect_token_ticker;
+                    self.typedata.client_mut().portfwd_connect_token_ticker =
+                        token.checked_add(1).unwrap();
+                    let mio_token = mio::Token(CATEGORY_PORTFWD_CONNECT | usize::from(token));
+                    self.poll
+                        .register(
+                            &socket,
+                            mio_token,
+                            mio::Ready::readable(),
+                            mio::PollOpt::edge(),
+                        )
+                        .unwrap();
+                    self.typedata
+                        .client_mut()
+                        .portfwd_connects
+                        .push(PortFwdConnect {
+                            connection: socket,
+                            reference: message_number,
+                            token,
+                        });
                 }
                 Mode::Server => {
                     log::warn!("Server sent PortFwdConnect");
                 }
             },
+            Message::PortFwdData {
+                reference,
+                direction,
+                data,
+            } => {
+                assert!(direction == &PortFwdDirection::RemoteBind);
+                assert!(self.config.mode == Mode::Server);
+                let connection_data = self
+                    .typedata
+                    .server_mut()
+                    .portfwd_accepts
+                    .iter_mut()
+                    .filter(|x| x.reference == *reference)
+                    .next()
+                    .unwrap();
+                std::io::Write::write_all(&mut connection_data.connection, &data).unwrap();
+            }
         }
     }
 
@@ -396,10 +462,51 @@ impl Oxy {
                 }
                 READLINE_TOKEN => {
                     while let Ok(input) = self.readline_rx.as_ref().unwrap().try_recv() {
-                        let mut command = ArrayVec::new();
-                        command.extend(input.as_bytes().iter().cloned());
-                        let message = Message::Command { command };
-                        self.send_message(&message);
+                        if input.chars().nth(0).unwrap_or('\0') != '!' {
+                            let mut command = ArrayVec::new();
+                            command.extend(input.as_bytes().iter().cloned());
+                            let message = Message::Command { command };
+                            self.send_message(&message);
+                        } else {
+                            if input.starts_with("!R ") {
+                                let spec = input.split(" ").nth(1);
+                                if spec.is_none() {
+                                    log::warn!("No spec!");
+                                    continue;
+                                }
+                                let spec = spec.unwrap();
+                                let input_lspec = spec.splitn(2, ":").nth(1);
+                                if input_lspec.is_none() {
+                                    log::warn!("No lspec");
+                                    continue;
+                                }
+                                let input_lspec = input_lspec.unwrap();
+                                let rport = spec.split(":").nth(0).unwrap_or("\0").parse();
+                                if rport.is_err() {
+                                    log::warn!("Invalid port.");
+                                }
+                                let rport: u16 = rport.unwrap();
+                                let rspec = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                                    "127.0.0.1".parse().unwrap(),
+                                    rport,
+                                ));
+                                if self.typedata.client().remote_portfwd_binds.is_full() {
+                                    log::warn!("Too many remote binds");
+                                    continue;
+                                }
+                                let message = Message::PortFwdBind { addr: rspec };
+                                let reference = self.send_message(&message);
+                                let mut lspec = ArrayString::default();
+                                lspec.push_str(input_lspec);
+                                self.typedata.client_mut().remote_portfwd_binds.push(
+                                    RemotePortFwdBind {
+                                        rspec,
+                                        reference,
+                                        lspec,
+                                    },
+                                );
+                            }
+                        }
                     }
                 }
                 _ => {
@@ -457,6 +564,48 @@ impl Oxy {
                         }
                         Err(err) => {
                             log::warn!("Unknown error while accepting: {:?}", err);
+                            break;
+                        }
+                    }
+                }
+            }
+            CATEGORY_PORTFWD_CONNECT => {
+                let token = u16::try_from(event.token().0 & 0xFFFF).unwrap();
+                loop {
+                    let data = self
+                        .typedata
+                        .client_mut()
+                        .portfwd_connects
+                        .iter_mut()
+                        .filter(|x| x.token == token)
+                        .next();
+                    if data.is_none() {
+                        log::warn!("Event for missing portfwd connect {:?}", event);
+                        return;
+                    }
+                    let data = data.unwrap();
+                    let mut read_buffer = ArrayVec::new();
+                    // This doesn't exist?? : read_buffer.resize(0, read_buffer.capacity());
+                    // This is totally eligible to just use unsafe { read_buffer.set_len() }, but...
+                    for _ in 0..read_buffer.capacity() {
+                        read_buffer.push(0);
+                    }
+                    let result = std::io::Read::read(&mut data.connection, &mut read_buffer);
+                    match result {
+                        Ok(amt) => {
+                            read_buffer.truncate(amt);
+                            let message = Message::PortFwdData {
+                                reference: data.reference,
+                                direction: PortFwdDirection::RemoteBind,
+                                data: read_buffer,
+                            };
+                            self.send_message(&message);
+                        }
+                        Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            break;
+                        }
+                        Err(err) => {
+                            log::warn!("Unknown portfwd connect read error: {:?}", err);
                             break;
                         }
                     }
