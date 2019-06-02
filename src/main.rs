@@ -1,7 +1,7 @@
-use arrayvec::ArrayVec;
+use arrayvec::{ArrayString, ArrayVec};
 use sodiumoxide::crypto::pwhash::argon2id13;
 use sodiumoxide::crypto::secretbox;
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::sync::Arc;
 
 #[derive(structopt::StructOpt, Clone)]
@@ -39,8 +39,23 @@ impl std::str::FromStr for Mode {
 
 #[derive(serde_derive::Serialize, serde_derive::Deserialize, Debug)]
 enum Message {
-    Command { command: ArrayVec<[u8; 8192]> },
-    Output { output: ArrayVec<[u8; 8192]> },
+    Reject {
+        reference: u64,
+        message: ArrayString<[u8; 8192]>,
+    },
+    Command {
+        command: ArrayVec<[u8; 8192]>,
+    },
+    Output {
+        reference: u64,
+        output: ArrayVec<[u8; 8192]>,
+    },
+    PortFwdBind {
+        addr: std::net::SocketAddr,
+    },
+    PortFwdConnect {
+        reference: u64,
+    },
 }
 
 fn fatal<T, E>(result: &Result<T, E>, msg: &str)
@@ -71,6 +86,10 @@ fn write_framed(w: &mut impl std::io::Write, message: &[u8], key: &secretbox::Ke
 
 const CONNECTION_TOKEN: mio::Token = mio::Token(0);
 const READLINE_TOKEN: mio::Token = mio::Token(1);
+const CATEGORY_BASE: usize = 0x00000000;
+#[deny(overflowing_literals)]
+const CATEGORY_PORTFWD_BIND: usize = 0x01000000;
+const CATEGORY_PORTFWD_ACCEPT: usize = 0x02000000;
 
 struct Oxy {
     connection: mio::net::TcpStream,
@@ -80,8 +99,75 @@ struct Oxy {
     config: Config,
     key: secretbox::Key,
     done: bool,
-    linefeed_interface: Option<Arc<linefeed::Interface<linefeed::terminal::DefaultTerminal>>>,
     readline_rx: Option<std::sync::mpsc::Receiver<String>>,
+    outbound_message_ticker: u64,
+    inbound_message_ticker: u64,
+    typedata: TypeData,
+    poll: mio::Poll,
+}
+
+enum TypeData {
+    Server(ServerData),
+    Client(ClientData),
+}
+
+impl TypeData {
+    fn server(&self) -> &ServerData {
+        match self {
+            TypeData::Server(x) => x,
+            _ => panic!("Wrong typedata type"),
+        }
+    }
+
+    fn server_mut(&mut self) -> &mut ServerData {
+        match self {
+            TypeData::Server(x) => x,
+            _ => panic!("Wrong typedata type"),
+        }
+    }
+
+    fn client(&self) -> &ClientData {
+        match self {
+            TypeData::Client(x) => x,
+            _ => panic!("Wrong typedata type"),
+        }
+    }
+
+    fn client_mut(&mut self) -> &mut ClientData {
+        match self {
+            TypeData::Client(x) => x,
+            _ => panic!("Wrong typedata type"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ServerData {
+    portfwd_binds: ArrayVec<[PortFwdBind; 10]>,
+    portfwd_accepts: ArrayVec<[PortFwdAccept; 10]>,
+    portfwd_connects: ArrayVec<[PortFwdConnect; 10]>,
+    portfwd_connect_token_ticker: u16,
+    portfwd_accept_token_ticker: u16,
+    portfwd_bind_token_ticker: u16,
+}
+
+struct PortFwdBind {
+    listener: mio::net::TcpListener,
+    reference: u64,
+    token: u16,
+}
+
+struct PortFwdAccept {
+    connection: mio::net::TcpStream,
+    reference: u64,
+    token: u16,
+}
+
+type PortFwdConnect = PortFwdAccept;
+
+#[derive(Default)]
+struct ClientData {
+    linefeed_interface: Option<Arc<linefeed::Interface<linefeed::terminal::DefaultTerminal>>>,
 }
 
 enum RecvConnectionResult {
@@ -162,7 +248,9 @@ impl Oxy {
             Ok(val) => {
                 let consumed: usize = cursor.position().try_into().unwrap();
                 self.message_buffer.drain(0..consumed);
-                self.handle_message(&val);
+                let message_id = self.inbound_message_ticker;
+                self.inbound_message_ticker = self.inbound_message_ticker.checked_add(1).unwrap();
+                self.handle_message(&val, message_id);
             }
             Err(err) => {
                 log::debug!("CBOR parse error: {:?}", err);
@@ -170,7 +258,7 @@ impl Oxy {
         }
     }
 
-    fn handle_message(&mut self, message: &Message) {
+    fn handle_message(&mut self, message: &Message, message_number: u64) {
         match message {
             Message::Command { command } => match &self.config.mode {
                 Mode::Server => {
@@ -184,6 +272,7 @@ impl Oxy {
                     message_output.extend(output.stdout);
                     let message = Message::Output {
                         output: message_output,
+                        reference: message_number,
                     };
                     let message = serde_cbor::to_vec(&message).unwrap();
                     write_framed(&mut self.connection, &message, &self.key);
@@ -192,9 +281,14 @@ impl Oxy {
                     log::warn!("Server tried to get client to execute command.");
                 }
             },
-            Message::Output { output } => match &self.config.mode {
+            Message::Output {
+                output,
+                reference: _,
+            } => match &self.config.mode {
                 Mode::Client => {
                     let mut writer = self
+                        .typedata
+                        .client()
                         .linefeed_interface
                         .as_ref()
                         .unwrap()
@@ -210,7 +304,63 @@ impl Oxy {
                     log::warn!("Client sent server command output");
                 }
             },
+            Message::PortFwdBind { addr } => match &self.config.mode {
+                Mode::Server => {
+                    let listener = mio::net::TcpListener::bind(&addr);
+                    if listener.is_err() {
+                        self.reject(message_number, "failed to bind");
+                        return;
+                    }
+                    let listener = listener.unwrap();
+                    let token = self.typedata.server().portfwd_bind_token_ticker;
+                    let mio_token = mio::Token(CATEGORY_PORTFWD_BIND | usize::from(token));
+                    self.poll
+                        .register(
+                            &listener,
+                            mio_token,
+                            mio::Ready::readable(),
+                            mio::PollOpt::edge(),
+                        )
+                        .unwrap();
+                    self.typedata.server_mut().portfwd_bind_token_ticker =
+                        token.checked_add(1).unwrap();
+                    let result = self
+                        .typedata
+                        .server_mut()
+                        .portfwd_binds
+                        .try_push(PortFwdBind {
+                            listener,
+                            reference: message_number,
+                            token: token,
+                        });
+                    if result.is_err() {
+                        self.reject(message_number, "too many binds");
+                        return;
+                    }
+                }
+                Mode::Client => {
+                    log::warn!("Server sent BindRequest to client.");
+                }
+            },
+            Message::Reject { message, reference } => {
+                log::trace!("Recieved rejection for {}: {:?}", reference, message);
+            }
+            Message::PortFwdConnect { reference } => match &self.config.mode {
+                Mode::Client => {
+                    ();
+                }
+                Mode::Server => {
+                    log::warn!("Server sent PortFwdConnect");
+                }
+            },
         }
+    }
+
+    fn reject(&mut self, reference: u64, message: &str) {
+        self.send_message(&Message::Reject {
+            reference,
+            message: ArrayString::from(message).unwrap(),
+        });
     }
 
     fn pump_connection(&mut self) {
@@ -238,43 +388,104 @@ impl Oxy {
     }
 
     fn handle_event(&mut self, event: mio::Event) {
-        match event.token() {
-            CONNECTION_TOKEN => {
-                self.pump_connection();
-            }
-            READLINE_TOKEN => {
-                while let Ok(input) = self.readline_rx.as_ref().unwrap().try_recv() {
-                    let mut command = ArrayVec::new();
-                    command.extend(input.as_bytes().iter().cloned());
-                    let message = Message::Command { command };
-                    let message = serde_cbor::to_vec(&message).unwrap();
-                    write_framed(&mut self.connection, &message, &self.key);
-                    log::debug!("Message sent successfully.");
+        let category = event.token().0 & 0xFF000000;
+        match category {
+            CATEGORY_BASE => match event.token() {
+                CONNECTION_TOKEN => {
+                    self.pump_connection();
+                }
+                READLINE_TOKEN => {
+                    while let Ok(input) = self.readline_rx.as_ref().unwrap().try_recv() {
+                        let mut command = ArrayVec::new();
+                        command.extend(input.as_bytes().iter().cloned());
+                        let message = Message::Command { command };
+                        self.send_message(&message);
+                    }
+                }
+                _ => {
+                    log::warn!("Event for unknown token: {:?}", event);
+                }
+            },
+            CATEGORY_PORTFWD_BIND => {
+                let token = u16::try_from(event.token().0 & 0xFFFF).unwrap();
+                loop {
+                    let portfwd_bind = self
+                        .typedata
+                        .server_mut()
+                        .portfwd_binds
+                        .iter_mut()
+                        .filter(|x| x.token == token)
+                        .next()
+                        .unwrap();
+                    let reference = portfwd_bind.reference;
+                    use std::io::ErrorKind::WouldBlock;
+                    let result = portfwd_bind.listener.accept();
+                    match result {
+                        Ok((peer, addr)) => {
+                            log::debug!("Accepting portfwd bind connection from {}", addr);
+                            if self.typedata.server().portfwd_accepts.is_full() {
+                                log::warn!("Portfwd accepts full");
+                                break;
+                            }
+                            let new_reference = self.send_message(&Message::PortFwdConnect {
+                                reference: reference,
+                            });
+                            let token = self.typedata.server().portfwd_accept_token_ticker;
+                            self.typedata.server_mut().portfwd_accept_token_ticker =
+                                token.checked_add(1).unwrap();
+                            let mio_token =
+                                mio::Token(CATEGORY_PORTFWD_ACCEPT | usize::from(token));
+                            self.poll
+                                .register(
+                                    &peer,
+                                    mio_token,
+                                    mio::Ready::readable(),
+                                    mio::PollOpt::edge(),
+                                )
+                                .unwrap();
+                            self.typedata
+                                .server_mut()
+                                .portfwd_accepts
+                                .push(PortFwdAccept {
+                                    connection: peer,
+                                    reference: new_reference,
+                                    token: token,
+                                });
+                        }
+                        Err(ref err) if err.kind() == WouldBlock => {
+                            break;
+                        }
+                        Err(err) => {
+                            log::warn!("Unknown error while accepting: {:?}", err);
+                            break;
+                        }
+                    }
                 }
             }
             _ => {
-                log::warn!("Event for unknown token: {:?}", event);
+                log::warn!("Unknown event category: {:?}", event);
             }
         }
     }
 
-    fn spawn_readline_thread(&mut self, poll: &mio::Poll) {
+    fn spawn_readline_thread(&mut self) {
         let interface = linefeed::Interface::new("oxy");
         fatal(&interface, "Failed to create linefeed interface");
         let interface = interface.unwrap();
         let _ = interface.set_prompt("oxy> ");
         let interface = Arc::new(interface);
-        self.linefeed_interface = Some(interface.clone());
+        self.typedata.client_mut().linefeed_interface = Some(interface.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         self.readline_rx = Some(rx);
         let (registration, set_readiness) = mio::Registration::new2();
-        poll.register(
-            &registration,
-            READLINE_TOKEN,
-            mio::Ready::readable(),
-            mio::PollOpt::edge(),
-        )
-        .unwrap();
+        self.poll
+            .register(
+                &registration,
+                READLINE_TOKEN,
+                mio::Ready::readable(),
+                mio::PollOpt::edge(),
+            )
+            .unwrap();
         std::thread::spawn(move || {
             let _registration = registration; // If we drop it MIO won't deliver events.
             loop {
@@ -291,23 +502,32 @@ impl Oxy {
         });
     }
 
+    fn send_message(&mut self, message: &Message) -> u64 {
+        let message_id = self.outbound_message_ticker;
+        self.outbound_message_ticker = self.outbound_message_ticker.checked_add(1).unwrap();
+        let message = serde_cbor::to_vec(&message).unwrap();
+        write_framed(&mut self.connection, &message, &self.key);
+        log::debug!("Message sent successfully.");
+        message_id
+    }
+
     fn run(&mut self) {
-        let poll = mio::Poll::new().unwrap();
-        poll.register(
-            &self.connection,
-            CONNECTION_TOKEN,
-            mio::Ready::readable(),
-            mio::PollOpt::edge(),
-        )
-        .unwrap();
+        self.poll
+            .register(
+                &self.connection,
+                CONNECTION_TOKEN,
+                mio::Ready::readable(),
+                mio::PollOpt::edge(),
+            )
+            .unwrap();
         let mut events = mio::Events::with_capacity(1024);
 
         if self.config.mode == Mode::Client {
-            self.spawn_readline_thread(&poll);
+            self.spawn_readline_thread();
         }
 
         loop {
-            poll.poll(&mut events, None).unwrap();
+            self.poll.poll(&mut events, None).unwrap();
             for event in &events {
                 self.handle_event(event);
             }
@@ -375,8 +595,11 @@ fn main() {
                         connection,
                         config: args,
                         done: false,
-                        linefeed_interface: None,
                         readline_rx: None,
+                        inbound_message_ticker: 0,
+                        outbound_message_ticker: 0,
+                        typedata: TypeData::Server(Default::default()),
+                        poll: mio::Poll::new().unwrap(),
                     };
                     oxy.run();
                 });
@@ -400,8 +623,11 @@ fn main() {
                 connection,
                 config: args,
                 done: false,
-                linefeed_interface: None,
                 readline_rx: None,
+                inbound_message_ticker: 0,
+                outbound_message_ticker: 0,
+                typedata: TypeData::Client(Default::default()),
+                poll: mio::Poll::new().unwrap(),
             };
             oxy.run();
         }
