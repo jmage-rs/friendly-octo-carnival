@@ -2,7 +2,6 @@ use arrayvec::ArrayVec;
 
 use crate::constants::*;
 use crate::types::*;
-use crate::util::*;
 
 impl Oxy {
     pub(crate) fn handle_message(&mut self, message: &Message, message_number: u64) {
@@ -21,8 +20,7 @@ impl Oxy {
                         output: message_output,
                         reference: message_number,
                     };
-                    let message = serde_cbor::to_vec(&message).unwrap();
-                    write_framed(&mut self.connection, &message, &self.key);
+                    self.send_message(&message);
                 }
                 Mode::Client => {
                     log::warn!("Server tried to get client to execute command.");
