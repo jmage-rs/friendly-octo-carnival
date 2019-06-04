@@ -31,6 +31,7 @@ pub struct MessageFramer<'a> {
     input: &'a [u8],
     working_buffer: [u8; 272],
     offset: usize,
+    done: bool,
 }
 
 impl MessageFramer<'_> {
@@ -39,17 +40,21 @@ impl MessageFramer<'_> {
             input,
             working_buffer: [0u8; 272],
             offset: 0,
+            done: false,
         }
     }
 }
 
 impl<'a> MessageFramer<'a> {
     fn next(&mut self) -> Option<&mut [u8]> {
-        let remaining = self.input.len().checked_sub(self.offset).unwrap();
-        if remaining == 0 {
+        if self.done {
             return None;
         }
+        let remaining = self.input.len().checked_sub(self.offset).unwrap();
         let amt = remaining.try_into().unwrap_or(255);
+        if amt != 255 {
+            self.done = true;
+        }
         self.working_buffer[0] = amt;
         let amt: usize = amt.into();
         let end = self.offset + amt;
@@ -89,5 +94,16 @@ fn message_framer_basic() {
     let _ = framer.next().unwrap();
     let frame = framer.next().unwrap();
     assert_eq!(235, frame[0]);
+    assert!(framer.next().is_none());
+    let mut a = Vec::new();
+    for _ in 0..255 {
+        a.push(b'a');
+    }
+    assert!(a.len() == 255);
+    let mut framer = MessageFramer::frame(&a);
+    let frame = framer.next().unwrap();
+    assert_eq!(255, frame[0]);
+    let frame = framer.next().unwrap();
+    assert_eq!(0, frame[0]);
     assert!(framer.next().is_none());
 }

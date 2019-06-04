@@ -4,7 +4,6 @@ mod oxy;
 mod types;
 mod util;
 
-use arrayvec::ArrayVec;
 use sodiumoxide::crypto::pwhash::argon2id13;
 use sodiumoxide::crypto::secretbox;
 
@@ -57,19 +56,13 @@ fn main() {
                     log::info!("Accepted connection from {}", addr);
                     let recv_buffer = [0u8; 296];
                     let recv_cursor: usize = 0;
-                    let message_buffer: ArrayVec<[u8; 16384]> = ArrayVec::new();
                     let connection = mio::net::TcpStream::from_stream(connection).unwrap();
                     let mut oxy = Oxy {
                         recv_buffer,
                         recv_cursor,
                         key,
-                        message_buffer,
                         connection,
                         config: args,
-                        done: false,
-                        readline_rx: None,
-                        inbound_message_ticker: 0,
-                        outbound_message_ticker: 0,
                         typedata: TypeData::Server(Default::default()),
                         poll: mio::Poll::new().unwrap(),
                         d: Default::default(),
@@ -92,13 +85,8 @@ fn main() {
                 recv_buffer: [0u8; 296],
                 recv_cursor: 0,
                 key,
-                message_buffer: ArrayVec::new(),
                 connection,
                 config: args,
-                done: false,
-                readline_rx: None,
-                inbound_message_ticker: 0,
-                outbound_message_ticker: 0,
                 typedata: TypeData::Client(Default::default()),
                 poll: mio::Poll::new().unwrap(),
                 d: Default::default(),

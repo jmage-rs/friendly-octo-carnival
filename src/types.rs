@@ -6,13 +6,8 @@ pub struct Oxy {
     pub connection: mio::net::TcpStream,
     pub recv_buffer: [u8; 296],
     pub recv_cursor: usize,
-    pub message_buffer: ArrayVec<[u8; 16384]>,
     pub config: Config,
     pub key: secretbox::Key,
-    pub done: bool,
-    pub readline_rx: Option<std::sync::mpsc::Receiver<String>>,
-    pub outbound_message_ticker: u64,
-    pub inbound_message_ticker: u64,
     pub typedata: TypeData,
     pub poll: mio::Poll,
     pub d: OxyDefault,
@@ -20,11 +15,15 @@ pub struct Oxy {
 
 #[derive(Default)]
 pub struct OxyDefault {
+    pub done: bool,
     pub portfwd_accepts: ArrayVec<[PortFwdAccept; 10]>,
     pub portfwd_connects: ArrayVec<[PortFwdConnect; 10]>,
     pub portfwd_connect_token_ticker: u16,
     pub portfwd_accept_token_ticker: u16,
     pub portfwd_bind_token_ticker: u16,
+    pub outbound_message_ticker: u64,
+    pub inbound_message_ticker: u64,
+    pub message_buffer: ArrayVec<[u8; 16384]>,
 }
 
 pub enum TypeData {
@@ -33,6 +32,7 @@ pub enum TypeData {
 }
 
 impl TypeData {
+    #[allow(dead_code)]
     pub fn server(&self) -> &ServerData {
         match self {
             TypeData::Server(x) => x,
@@ -83,6 +83,7 @@ pub type PortFwdConnect = PortFwdAccept;
 
 #[derive(Default)]
 pub struct ClientData {
+    pub readline_rx: Option<std::sync::mpsc::Receiver<String>>,
     pub linefeed_interface: Option<Arc<linefeed::Interface<linefeed::terminal::DefaultTerminal>>>,
     pub remote_portfwd_binds: ArrayVec<[RemotePortFwdBind; 10]>,
     pub local_portfwd_binds: ArrayVec<[LocalPortFwdBind; 10]>,

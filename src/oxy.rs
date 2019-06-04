@@ -55,31 +55,35 @@ impl Oxy {
     }
 
     pub fn consume_connection_frame(&mut self) {
-        self.decrypt_message_frame();
-        self.try_parse_message();
+        if self.decrypt_message_frame() {
+            self.try_parse_message();
+        }
     }
 
-    pub fn decrypt_message_frame(&mut self) {
+    pub fn decrypt_message_frame(&mut self) -> bool {
         let nonce = secretbox::Nonce::from_slice(&self.recv_buffer[..24]).unwrap();
         let tag = secretbox::Tag::from_slice(&self.recv_buffer[24..][256..]).unwrap();
         secretbox::open_detached(&mut self.recv_buffer[24..][..256], &tag, &nonce, &self.key)
             .unwrap();
         let amt: usize = self.recv_buffer[24].into();
 
-        self.message_buffer
+        self.d
+            .message_buffer
             .extend(self.recv_buffer[24..][1..][..amt].iter().cloned());
         self.recv_cursor = 0;
+        return amt < 255;
     }
 
     pub fn try_parse_message(&mut self) {
-        let mut cursor = std::io::Cursor::new(&self.message_buffer[..]);
+        let mut cursor = std::io::Cursor::new(&self.d.message_buffer[..]);
         let parse_result = serde_cbor::from_reader::<Message, _>(&mut cursor);
         match parse_result {
             Ok(val) => {
                 let consumed: usize = cursor.position().try_into().unwrap();
-                self.message_buffer.drain(0..consumed);
-                let message_id = self.inbound_message_ticker;
-                self.inbound_message_ticker = self.inbound_message_ticker.checked_add(1).unwrap();
+                self.d.message_buffer.drain(0..consumed);
+                let message_id = self.d.inbound_message_ticker;
+                self.d.inbound_message_ticker =
+                    self.d.inbound_message_ticker.checked_add(1).unwrap();
                 self.handle_message(&val, message_id);
             }
             Err(err) => {
@@ -108,7 +112,7 @@ impl Oxy {
                     unreachable!();
                 }
                 Ok(RecvConnectionResult::Disconnected) => {
-                    self.done = true;
+                    self.d.done = true;
                     break;
                 }
                 Err(err) => {
@@ -116,6 +120,88 @@ impl Oxy {
                     break;
                 }
             }
+        }
+    }
+
+    pub fn handle_input(&mut self, input: &str) {
+        if input.chars().nth(0).unwrap_or('\0') != '!' {
+            let mut command = ArrayVec::new();
+            command.extend(input.as_bytes().iter().cloned());
+            let message = Message::Command { command };
+            self.send_message(&message);
+        } else {
+            if input.starts_with("!R ") {
+                let spec = input.split(" ").nth(1);
+                if spec.is_none() {
+                    log::warn!("No spec!");
+                    return;
+                }
+                let spec = spec.unwrap();
+                let input_lspec = spec.splitn(2, ":").nth(1);
+                if input_lspec.is_none() {
+                    log::warn!("No lspec");
+                    return;
+                }
+                let input_lspec = input_lspec.unwrap();
+                let rport = spec.split(":").nth(0).unwrap_or("\0").parse();
+                if rport.is_err() {
+                    log::warn!("Invalid port.");
+                }
+                let rport: u16 = rport.unwrap();
+                let rspec = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                    "127.0.0.1".parse().unwrap(),
+                    rport,
+                ));
+                if self.typedata.client().remote_portfwd_binds.is_full() {
+                    log::warn!("Too many remote binds");
+                    return;
+                }
+                let message = Message::PortFwdBind { addr: rspec };
+                let reference = self.send_message(&message);
+                let mut lspec = ArrayString::default();
+                lspec.push_str(input_lspec);
+                self.typedata
+                    .client_mut()
+                    .remote_portfwd_binds
+                    .push(RemotePortFwdBind {
+                        rspec,
+                        reference,
+                        lspec,
+                    });
+            }
+        }
+        if input.starts_with("!L ") {
+            let spec = input.split(" ").nth(1);
+            if spec.is_none() {
+                log::warn!("No spec!");
+                return;
+            }
+            let spec = spec.unwrap();
+            let bind_port: u16 = spec.splitn(2, ":").nth(0).unwrap().parse().unwrap();
+            let listener =
+                mio::net::TcpListener::bind(&format!("127.0.0.1:{}", bind_port).parse().unwrap())
+                    .unwrap();
+            let mut rspec = ArrayString::new();
+            rspec.push_str(spec.splitn(2, ":").nth(1).unwrap());
+            let token = self.d.portfwd_bind_token_ticker;
+            self.d.portfwd_bind_token_ticker = token.checked_add(1).unwrap();
+            let mio_token = mio::Token(CATEGORY_PORTFWD_BIND | usize::from(token));
+            self.poll
+                .register(
+                    &listener,
+                    mio_token,
+                    mio::Ready::readable(),
+                    mio::PollOpt::edge(),
+                )
+                .unwrap();
+            self.typedata
+                .client_mut()
+                .local_portfwd_binds
+                .push(LocalPortFwdBind {
+                    listener,
+                    rspec,
+                    token,
+                });
         }
     }
 
@@ -127,87 +213,15 @@ impl Oxy {
                     self.pump_connection();
                 }
                 READLINE_TOKEN => {
-                    while let Ok(input) = self.readline_rx.as_ref().unwrap().try_recv() {
-                        if input.chars().nth(0).unwrap_or('\0') != '!' {
-                            let mut command = ArrayVec::new();
-                            command.extend(input.as_bytes().iter().cloned());
-                            let message = Message::Command { command };
-                            self.send_message(&message);
-                        } else {
-                            if input.starts_with("!R ") {
-                                let spec = input.split(" ").nth(1);
-                                if spec.is_none() {
-                                    log::warn!("No spec!");
-                                    continue;
-                                }
-                                let spec = spec.unwrap();
-                                let input_lspec = spec.splitn(2, ":").nth(1);
-                                if input_lspec.is_none() {
-                                    log::warn!("No lspec");
-                                    continue;
-                                }
-                                let input_lspec = input_lspec.unwrap();
-                                let rport = spec.split(":").nth(0).unwrap_or("\0").parse();
-                                if rport.is_err() {
-                                    log::warn!("Invalid port.");
-                                }
-                                let rport: u16 = rport.unwrap();
-                                let rspec = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
-                                    "127.0.0.1".parse().unwrap(),
-                                    rport,
-                                ));
-                                if self.typedata.client().remote_portfwd_binds.is_full() {
-                                    log::warn!("Too many remote binds");
-                                    continue;
-                                }
-                                let message = Message::PortFwdBind { addr: rspec };
-                                let reference = self.send_message(&message);
-                                let mut lspec = ArrayString::default();
-                                lspec.push_str(input_lspec);
-                                self.typedata.client_mut().remote_portfwd_binds.push(
-                                    RemotePortFwdBind {
-                                        rspec,
-                                        reference,
-                                        lspec,
-                                    },
-                                );
-                            }
-                        }
-                        if input.starts_with("!L ") {
-                            let spec = input.split(" ").nth(1);
-                            if spec.is_none() {
-                                log::warn!("No spec!");
-                                continue;
-                            }
-                            let spec = spec.unwrap();
-                            let bind_port: u16 =
-                                spec.splitn(2, ":").nth(0).unwrap().parse().unwrap();
-                            let listener = mio::net::TcpListener::bind(
-                                &format!("127.0.0.1:{}", bind_port).parse().unwrap(),
-                            )
-                            .unwrap();
-                            let mut rspec = ArrayString::new();
-                            rspec.push_str(spec.splitn(2, ":").nth(1).unwrap());
-                            let token = self.d.portfwd_bind_token_ticker;
-                            self.d.portfwd_bind_token_ticker = token.checked_add(1).unwrap();
-                            let mio_token = mio::Token(CATEGORY_PORTFWD_BIND | usize::from(token));
-                            self.poll
-                                .register(
-                                    &listener,
-                                    mio_token,
-                                    mio::Ready::readable(),
-                                    mio::PollOpt::edge(),
-                                )
-                                .unwrap();
-                            self.typedata
-                                .client_mut()
-                                .local_portfwd_binds
-                                .push(LocalPortFwdBind {
-                                    listener,
-                                    rspec,
-                                    token,
-                                });
-                        }
+                    while let Ok(input) = self
+                        .typedata
+                        .client()
+                        .readline_rx
+                        .as_ref()
+                        .unwrap()
+                        .try_recv()
+                    {
+                        self.handle_input(&input);
                     }
                 }
                 _ => {
@@ -392,7 +406,7 @@ impl Oxy {
         let interface = Arc::new(interface);
         self.typedata.client_mut().linefeed_interface = Some(interface.clone());
         let (tx, rx) = std::sync::mpsc::channel();
-        self.readline_rx = Some(rx);
+        self.typedata.client_mut().readline_rx = Some(rx);
         let (registration, set_readiness) = mio::Registration::new2();
         self.poll
             .register(
@@ -419,8 +433,8 @@ impl Oxy {
     }
 
     pub fn send_message(&mut self, message: &Message) -> u64 {
-        let message_id = self.outbound_message_ticker;
-        self.outbound_message_ticker = self.outbound_message_ticker.checked_add(1).unwrap();
+        let message_id = self.d.outbound_message_ticker;
+        self.d.outbound_message_ticker = self.d.outbound_message_ticker.checked_add(1).unwrap();
         let message = serde_cbor::to_vec(&message).unwrap();
         write_framed(&mut self.connection, &message, &self.key);
         log::debug!("Message sent successfully.");
@@ -448,7 +462,7 @@ impl Oxy {
                 self.handle_event(event);
             }
             events.clear();
-            if self.done {
+            if self.d.done {
                 break;
             }
         }
