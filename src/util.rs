@@ -1,3 +1,4 @@
+use sodiumoxide::crypto::pwhash::argon2id13;
 use sodiumoxide::crypto::secretbox;
 use std::convert::TryInto;
 
@@ -19,6 +20,7 @@ pub fn write_framed_explicit(w: &mut impl std::io::Write, message: &[u8], key: &
     while let Some(frame) = framer.next() {
         let mut write_buffer = [0u8; 296];
         let nonce = secretbox::gen_nonce();
+        log::trace!("Sending using explicit nonce: {:?}", nonce);
         write_buffer[..24].copy_from_slice(&nonce.0);
         write_buffer[24..][..256].copy_from_slice(&frame[..256]);
         let tag = secretbox::seal_detached(&mut write_buffer[24..][..256], &nonce, &key);
@@ -42,6 +44,22 @@ pub fn write_framed(
         write_buffer[256..].copy_from_slice(&tag.0);
         std::io::Write::write_all(w, &write_buffer).unwrap();
     }
+}
+
+pub fn derive_key(password: &[u8]) -> secretbox::Key {
+    let salt =
+        argon2id13::Salt::from_slice(b"i7'\xe0\xf0\xe6\xc0\xb2\xf9V\x1b\xe4\xc8\xb6\x95\x07")
+            .unwrap();
+    let mut key_buffer = [0u8; 32];
+    let key_bytes = argon2id13::derive_key(
+        &mut key_buffer[..],
+        password,
+        &salt,
+        argon2id13::OPSLIMIT_INTERACTIVE,
+        argon2id13::MEMLIMIT_INTERACTIVE,
+    )
+    .unwrap();
+    secretbox::Key::from_slice(key_bytes).unwrap()
 }
 
 pub struct MessageFramer<'a> {

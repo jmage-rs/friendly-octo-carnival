@@ -247,6 +247,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "jcirclebuffer"
+version = "0.1.0"
+source = "git+https://github.com/jmage-rs/jcirclebuffer.git?rev=1e81f481a95c48b9a53f2912e81b8dd9f8d4474b#1e81f481a95c48b9a53f2912e81b8dd9f8d4474b"
+
+[[package]]
 name = "kernel32-sys"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -401,6 +406,7 @@ version = "0.1.0"
 dependencies = [
  "arrayvec 0.4.10 (registry+https://github.com/rust-lang/crates.io-index)",
  "env_logger 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "jcirclebuffer 0.1.0 (git+https://github.com/jmage-rs/jcirclebuffer.git?rev=1e81f481a95c48b9a53f2912e81b8dd9f8d4474b)",
  "linefeed 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "log 0.4.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "mio 0.6.19 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -938,6 +944,7 @@ dependencies = [
 "checksum heck 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)" = "20564e78d53d2bb135c343b3f47714a56af2061f1c928fdb541dc7b9fdd94205"
 "checksum humantime 1.2.0 (registry+https://github.com/rust-lang/crates.io-index)" = "3ca7e5f2e110db35f93b837c81797f3714500b81d517bf20c431b16d3ca4f114"
 "checksum iovec 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)" = "dbe6e417e7d0975db6512b90796e8ce223145ac4e33c377e4a42882a0e88bb08"
+"checksum jcirclebuffer 0.1.0 (git+https://github.com/jmage-rs/jcirclebuffer.git?rev=1e81f481a95c48b9a53f2912e81b8dd9f8d4474b)" = "<none>"
 "checksum kernel32-sys 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)" = "7507624b29483431c0ba2d82aece8ca6cdba9382bff4ddd0f7490560c056098d"
 "checksum lazy_static 1.3.0 (registry+https://github.com/rust-lang/crates.io-index)" = "bc5729f27f159ddd61f4df6228e827e86643d4d3e7c32183cb30a1c08f604a14"
 "checksum libc 0.2.55 (registry+https://github.com/rust-lang/crates.io-index)" = "42914d39aad277d9e176efbdad68acb1d5443ab65afe0e0e4f0d49352a950880"

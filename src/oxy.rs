@@ -1,6 +1,6 @@
 use arrayvec::{ArrayString, ArrayVec};
 use sodiumoxide::crypto::secretbox;
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryFrom;
 use std::sync::Arc;
 
 use crate::constants::*;
@@ -8,17 +8,42 @@ use crate::types::*;
 use crate::util::*;
 
 impl Oxy {
-    pub fn recv_connection_single(&mut self) -> std::io::Result<RecvConnectionResult> {
-        let tail = if self.d.inbound_nonce.is_some() {
-            272
-        } else {
-            296
-        };
-        debug_assert!(self.recv_buffer[self.recv_cursor..tail].len() != 0);
-        let result = std::io::Read::read(
-            &mut self.connection,
-            &mut self.recv_buffer[self.recv_cursor..],
+    pub fn new(connection: mio::net::TcpStream, config: Config) -> Oxy {
+        let key = derive_key(
+            config
+                .password
+                .as_ref()
+                .map(|x| x.as_str())
+                .unwrap_or("")
+                .as_bytes(),
         );
+        match &config.mode {
+            Mode::Client => Oxy {
+                key,
+                connection,
+                config,
+                typedata: TypeData::Client(Default::default()),
+                poll: mio::Poll::new().unwrap(),
+                d: Default::default(),
+            },
+            Mode::Server => Oxy {
+                key,
+                connection,
+                config,
+                typedata: TypeData::Server(Default::default()),
+                poll: mio::Poll::new().unwrap(),
+                d: Default::default(),
+            },
+        }
+    }
+
+    pub fn recv_connection_single(&mut self) -> std::io::Result<RecvConnectionResult> {
+        let buf = self.d.recv_buffer.get_fillable_area();
+        if buf.is_none() {
+            return Ok(RecvConnectionResult::Full);
+        }
+        let buf = buf.unwrap();
+        let result = std::io::Read::read(&mut self.connection, buf);
         match result {
             Ok(amt) => {
                 log::info!("Read {}", amt);
@@ -26,10 +51,8 @@ impl Oxy {
                     log::info!("Disconnected");
                     return Ok(RecvConnectionResult::Disconnected);
                 }
-                self.recv_cursor = self.recv_cursor.checked_add(amt).unwrap();
-                if self.recv_cursor > tail {
-                    panic!("That shouldn't happen");
-                } else if self.recv_cursor == tail {
+                self.d.recv_buffer.fill(amt);
+                if self.d.recv_buffer.is_full() {
                     return Ok(RecvConnectionResult::Full);
                 } else {
                     return Ok(RecvConnectionResult::KeepGoing);
@@ -65,41 +88,89 @@ impl Oxy {
         }
     }
 
+    pub fn consume_connection_frames(&mut self) {
+        loop {
+            let frame_size = if self.d.inbound_nonce.is_some() {
+                272
+            } else {
+                296
+            };
+            if self.d.recv_buffer.len() < frame_size {
+                break;
+            }
+            self.consume_connection_frame();
+        }
+    }
+
+    pub fn decrypt_message_frame_explicit(
+        frame: &mut [u8],
+        message_buffer: &mut jcirclebuffer::CircleBuffer<Vec<u8>>,
+        key: &secretbox::Key,
+    ) -> bool {
+        let nonce = secretbox::Nonce::from_slice(&frame[..24]).unwrap();
+        log::trace!("Decrypting using explicit nonce: {:?}", nonce);
+        let tag = secretbox::Tag::from_slice(&frame[24..][256..]).unwrap();
+        let body = &mut frame[24..][..256];
+        secretbox::open_detached(body, &tag, &nonce, key).unwrap();
+        let amt: usize = body[0].into();
+        message_buffer.extend(&body[1..=amt]);
+        amt < 255
+    }
+
+    pub fn decrypt_message_frame_implicit(
+        frame: &mut [u8],
+        message_buffer: &mut jcirclebuffer::CircleBuffer<Vec<u8>>,
+        key: &secretbox::Key,
+        nonce: &secretbox::Nonce,
+    ) -> bool {
+        let tag = secretbox::Tag::from_slice(&frame[256..]).unwrap();
+        let body = &mut frame[..256];
+        log::trace!("Decrypting using implicit nonce: {:?}", nonce);
+        secretbox::open_detached(body, &tag, &nonce, key).unwrap();
+        let amt: usize = body[0].into();
+        message_buffer.extend(&body[1..=amt]);
+        amt < 255
+    }
+
     pub fn decrypt_message_frame(&mut self) -> bool {
-        let tag;
-        let nonce;
-        let body;
         if self.d.inbound_nonce.is_none() {
-            nonce = secretbox::Nonce::from_slice(&self.recv_buffer[..24]).unwrap();
-            tag = secretbox::Tag::from_slice(&self.recv_buffer[24..][256..]).unwrap();
-            body = &mut self.recv_buffer[24..][..256];
+            let mut if_discontiguous_buffer = [0u8; 296];
+            let message_buffer = &mut self.d.message_buffer;
+            let key = &self.key;
+            let result = self
+                .d
+                .recv_buffer
+                .view_provided_mut(&mut if_discontiguous_buffer, |frame| {
+                    Self::decrypt_message_frame_explicit(frame, message_buffer, key)
+                });
+            self.d.recv_buffer.consume(296);
+            result
         } else {
-            nonce = self.d.inbound_nonce.unwrap();
+            let mut if_discontiguous_buffer = [0u8; 272];
+            let message_buffer = &mut self.d.message_buffer;
+            let key = &self.key;
+            let nonce = self.d.inbound_nonce.unwrap();
+            let result = self
+                .d
+                .recv_buffer
+                .view_provided_mut(&mut if_discontiguous_buffer, |frame| {
+                    Self::decrypt_message_frame_implicit(frame, message_buffer, key, &nonce)
+                });
+            self.d.recv_buffer.consume(272);
             self.d
                 .inbound_nonce
                 .as_mut()
                 .unwrap()
                 .increment_le_inplace();
-            tag = secretbox::Tag::from_slice(&self.recv_buffer[256..][..16]).unwrap();
-            body = &mut self.recv_buffer[..256];
+            result
         }
-        secretbox::open_detached(body, &tag, &nonce, &self.key).unwrap();
-        let amt: usize = body[0].into();
-
-        self.d
-            .message_buffer
-            .extend(body[1..][..amt].iter().cloned());
-        self.recv_cursor = 0;
-        return amt < 255;
     }
 
     pub fn try_parse_message(&mut self) {
-        let mut cursor = std::io::Cursor::new(&self.d.message_buffer[..]);
-        let parse_result = serde_cbor::from_reader::<Message, _>(&mut cursor);
+        let parse_result = serde_cbor::from_slice::<Message>(&self.d.message_buffer.view_nocopy());
+        self.d.message_buffer.consume(self.d.message_buffer.len());
         match parse_result {
             Ok(val) => {
-                let consumed: usize = cursor.position().try_into().unwrap();
-                self.d.message_buffer.drain(0..consumed);
                 let message_id = self.d.inbound_message_ticker;
                 self.d.inbound_message_ticker =
                     self.d.inbound_message_ticker.checked_add(1).unwrap();
@@ -122,9 +193,10 @@ impl Oxy {
         loop {
             match self.recv_connection_multi() {
                 Ok(RecvConnectionResult::Full) => {
-                    self.consume_connection_frame();
+                    self.consume_connection_frames();
                 }
                 Ok(RecvConnectionResult::WouldBlock) => {
+                    self.consume_connection_frames();
                     break;
                 }
                 Ok(RecvConnectionResult::KeepGoing) => {

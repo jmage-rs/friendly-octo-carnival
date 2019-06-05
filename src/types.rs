@@ -4,8 +4,6 @@ use std::sync::Arc;
 
 pub struct Oxy {
     pub connection: mio::net::TcpStream,
-    pub recv_buffer: [u8; 296],
-    pub recv_cursor: usize,
     pub config: Config,
     pub key: secretbox::Key,
     pub typedata: TypeData,
@@ -23,9 +21,10 @@ pub struct OxyDefault {
     pub portfwd_bind_token_ticker: u16,
     pub outbound_message_ticker: u64,
     pub inbound_message_ticker: u64,
-    pub message_buffer: ArrayVec<[u8; 16384]>,
     pub outbound_nonce: Option<secretbox::Nonce>,
     pub inbound_nonce: Option<secretbox::Nonce>,
+    pub recv_buffer: jcirclebuffer::CircleBuffer<Vec<u8>>,
+    pub message_buffer: jcirclebuffer::CircleBuffer<Vec<u8>>,
 }
 
 pub enum TypeData {
