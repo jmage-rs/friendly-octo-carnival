@@ -1,6 +1,8 @@
 mod constants;
 mod handle_message;
 mod oxy;
+#[cfg(test)]
+mod tests;
 mod types;
 mod util;
 
