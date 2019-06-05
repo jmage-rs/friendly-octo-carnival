@@ -24,6 +24,8 @@ pub struct OxyDefault {
     pub outbound_message_ticker: u64,
     pub inbound_message_ticker: u64,
     pub message_buffer: ArrayVec<[u8; 16384]>,
+    pub outbound_nonce: Option<secretbox::Nonce>,
+    pub inbound_nonce: Option<secretbox::Nonce>,
 }
 
 pub enum TypeData {
@@ -128,6 +130,10 @@ pub struct Config {
 
 #[derive(serde_derive::Serialize, serde_derive::Deserialize, Debug)]
 pub enum Message {
+    NonceUpdate {
+        client_send: [u8; 24],
+        client_recv: [u8; 24],
+    },
     Reject {
         reference: u64,
         message: ArrayString<[u8; 8192]>,

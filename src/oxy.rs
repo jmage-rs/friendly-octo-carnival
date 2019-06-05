@@ -9,7 +9,12 @@ use crate::util::*;
 
 impl Oxy {
     pub fn recv_connection_single(&mut self) -> std::io::Result<RecvConnectionResult> {
-        debug_assert!(self.recv_buffer[self.recv_cursor..].len() != 0);
+        let tail = if self.d.inbound_nonce.is_some() {
+            272
+        } else {
+            296
+        };
+        debug_assert!(self.recv_buffer[self.recv_cursor..tail].len() != 0);
         let result = std::io::Read::read(
             &mut self.connection,
             &mut self.recv_buffer[self.recv_cursor..],
@@ -22,9 +27,9 @@ impl Oxy {
                     return Ok(RecvConnectionResult::Disconnected);
                 }
                 self.recv_cursor = self.recv_cursor.checked_add(amt).unwrap();
-                if self.recv_cursor > 296 {
+                if self.recv_cursor > tail {
                     panic!("That shouldn't happen");
-                } else if self.recv_cursor == 296 {
+                } else if self.recv_cursor == tail {
                     return Ok(RecvConnectionResult::Full);
                 } else {
                     return Ok(RecvConnectionResult::KeepGoing);
@@ -61,15 +66,29 @@ impl Oxy {
     }
 
     pub fn decrypt_message_frame(&mut self) -> bool {
-        let nonce = secretbox::Nonce::from_slice(&self.recv_buffer[..24]).unwrap();
-        let tag = secretbox::Tag::from_slice(&self.recv_buffer[24..][256..]).unwrap();
-        secretbox::open_detached(&mut self.recv_buffer[24..][..256], &tag, &nonce, &self.key)
-            .unwrap();
-        let amt: usize = self.recv_buffer[24].into();
+        let tag;
+        let nonce;
+        let body;
+        if self.d.inbound_nonce.is_none() {
+            nonce = secretbox::Nonce::from_slice(&self.recv_buffer[..24]).unwrap();
+            tag = secretbox::Tag::from_slice(&self.recv_buffer[24..][256..]).unwrap();
+            body = &mut self.recv_buffer[24..][..256];
+        } else {
+            nonce = self.d.inbound_nonce.unwrap();
+            self.d
+                .inbound_nonce
+                .as_mut()
+                .unwrap()
+                .increment_le_inplace();
+            tag = secretbox::Tag::from_slice(&self.recv_buffer[256..][..16]).unwrap();
+            body = &mut self.recv_buffer[..256];
+        }
+        secretbox::open_detached(body, &tag, &nonce, &self.key).unwrap();
+        let amt: usize = body[0].into();
 
         self.d
             .message_buffer
-            .extend(self.recv_buffer[24..][1..][..amt].iter().cloned());
+            .extend(body[1..][..amt].iter().cloned());
         self.recv_cursor = 0;
         return amt < 255;
     }
@@ -436,12 +455,17 @@ impl Oxy {
         let message_id = self.d.outbound_message_ticker;
         self.d.outbound_message_ticker = self.d.outbound_message_ticker.checked_add(1).unwrap();
         let message = serde_cbor::to_vec(&message).unwrap();
-        write_framed(&mut self.connection, &message, &self.key);
+        if let Some(nonce) = &mut self.d.outbound_nonce {
+            write_framed(&mut self.connection, &message, &self.key, nonce);
+        } else {
+            write_framed_explicit(&mut self.connection, &message, &self.key);
+        }
         log::debug!("Message sent successfully.");
         message_id
     }
 
     pub fn run(&mut self) {
+        sodiumoxide::init().unwrap();
         self.poll
             .register(
                 &self.connection,
@@ -452,8 +476,21 @@ impl Oxy {
             .unwrap();
         let mut events = mio::Events::with_capacity(1024);
 
-        if self.config.mode == Mode::Client {
-            self.spawn_readline_thread();
+        match &self.config.mode {
+            Mode::Client => {
+                self.spawn_readline_thread();
+            }
+            Mode::Server => {
+                let client_send = secretbox::gen_nonce();
+                let client_recv = secretbox::gen_nonce();
+                let message = Message::NonceUpdate {
+                    client_send: client_send.0,
+                    client_recv: client_recv.0,
+                };
+                self.send_message(&message);
+                self.d.outbound_nonce = Some(client_recv);
+                self.d.inbound_nonce = Some(client_send);
+            }
         }
 
         loop {

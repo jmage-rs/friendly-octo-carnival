@@ -1,4 +1,5 @@
 use arrayvec::ArrayVec;
+use sodiumoxide::crypto::secretbox;
 
 use crate::constants::*;
 use crate::types::*;
@@ -222,6 +223,21 @@ impl Oxy {
                 }
                 Mode::Client => {
                     log::warn!("Server sent TunnelConnect");
+                }
+            },
+            Message::NonceUpdate {
+                client_send,
+                client_recv,
+            } => match &self.config.mode {
+                Mode::Server => {
+                    self.d.outbound_nonce =
+                        Some(secretbox::Nonce::from_slice(client_recv).unwrap());
+                    self.d.inbound_nonce = Some(secretbox::Nonce::from_slice(client_send).unwrap());
+                }
+                Mode::Client => {
+                    self.d.outbound_nonce =
+                        Some(secretbox::Nonce::from_slice(client_send).unwrap());
+                    self.d.inbound_nonce = Some(secretbox::Nonce::from_slice(client_recv).unwrap());
                 }
             },
         }

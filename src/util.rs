@@ -14,7 +14,7 @@ where
     }
 }
 
-pub fn write_framed(w: &mut impl std::io::Write, message: &[u8], key: &secretbox::Key) {
+pub fn write_framed_explicit(w: &mut impl std::io::Write, message: &[u8], key: &secretbox::Key) {
     let mut framer = MessageFramer::frame(&message);
     while let Some(frame) = framer.next() {
         let mut write_buffer = [0u8; 296];
@@ -23,6 +23,23 @@ pub fn write_framed(w: &mut impl std::io::Write, message: &[u8], key: &secretbox
         write_buffer[24..][..256].copy_from_slice(&frame[..256]);
         let tag = secretbox::seal_detached(&mut write_buffer[24..][..256], &nonce, &key);
         write_buffer[24..][256..].copy_from_slice(&tag.0);
+        std::io::Write::write_all(w, &write_buffer).unwrap();
+    }
+}
+
+pub fn write_framed(
+    w: &mut impl std::io::Write,
+    message: &[u8],
+    key: &secretbox::Key,
+    nonce: &mut secretbox::Nonce,
+) {
+    let mut framer = MessageFramer::frame(&message);
+    while let Some(frame) = framer.next() {
+        let mut write_buffer = [0u8; 272];
+        write_buffer[..256].copy_from_slice(&frame[..256]);
+        let tag = secretbox::seal_detached(&mut write_buffer[..256], &nonce, &key);
+        nonce.increment_le_inplace();
+        write_buffer[256..].copy_from_slice(&tag.0);
         std::io::Write::write_all(w, &write_buffer).unwrap();
     }
 }
