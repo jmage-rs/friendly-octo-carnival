@@ -297,6 +297,73 @@ impl Oxy {
     }
 
     pub fn handle_event(&mut self, event: mio::Event) {
+        if event.readiness().is_readable() {
+            self.handle_readable_event(event);
+        }
+        if event.readiness().is_writable() {
+            self.handle_writable_event(event);
+        }
+    }
+
+    fn pump_connection_write_single(&mut self) -> PumpConnectionWriteResult {
+        let (a, b) = self.d.send_buffer.view_parts(self.d.send_buffer.len());
+        let alen = a.len();
+        let blen = b.len();
+        let result = std::io::Write::write(&mut self.connection, &a).ok();
+        if result.is_none() {
+            return PumpConnectionWriteResult::Done;
+        }
+        if result.unwrap() < alen {
+            self.d.send_buffer.consume(result.unwrap());
+            return PumpConnectionWriteResult::KeepGoing;
+        }
+        if blen == 0 {
+            self.d.send_buffer.consume(result.unwrap());
+            return PumpConnectionWriteResult::Done;
+        }
+        let result = std::io::Write::write(&mut self.connection, &b).ok();
+        if result.is_none() {
+            return PumpConnectionWriteResult::Done;
+        }
+        self.d.send_buffer.consume(alen);
+        self.d.send_buffer.consume(result.unwrap());
+        if result.unwrap() < blen {
+            return PumpConnectionWriteResult::KeepGoing;
+        }
+        return PumpConnectionWriteResult::Done;
+    }
+
+    fn pump_connection_write_multi(&mut self) {
+        loop {
+            match self.pump_connection_write_single() {
+                PumpConnectionWriteResult::KeepGoing => {
+                    continue;
+                }
+                PumpConnectionWriteResult::Done => {
+                    return;
+                }
+            }
+        }
+    }
+
+    pub fn handle_writable_event(&mut self, event: mio::Event) {
+        let category = event.token().0 & 0xFF000000;
+        match category {
+            CATEGORY_BASE => match event.token() {
+                CONNECTION_TOKEN => {
+                    self.pump_connection_write_multi();
+                }
+                _ => {
+                    log::warn!("Unknown writable event: {:?}", event);
+                }
+            },
+            _ => {
+                log::warn!("Unknown writable event: {:?}", event);
+            }
+        }
+    }
+
+    pub fn handle_readable_event(&mut self, event: mio::Event) {
         let category = event.token().0 & 0xFF000000;
         match category {
             CATEGORY_BASE => match event.token() {
@@ -566,6 +633,7 @@ impl Oxy {
         }
 
         loop {
+            self.reregister();
             self.poll.poll(&mut events, None).unwrap();
             for event in &events {
                 self.handle_event(event);
@@ -575,5 +643,23 @@ impl Oxy {
                 break;
             }
         }
+    }
+
+    fn reregister(&mut self) {
+        let mut primary_interest = mio::Ready::empty();
+        if !self.d.recv_buffer.is_full() {
+            primary_interest |= mio::Ready::readable();
+        }
+        if !self.d.send_buffer.is_empty() {
+            primary_interest |= mio::Ready::writable();
+        }
+        self.poll
+            .reregister(
+                &self.connection,
+                CONNECTION_TOKEN,
+                primary_interest,
+                mio::PollOpt::edge(),
+            )
+            .expect("reregister failed");
     }
 }

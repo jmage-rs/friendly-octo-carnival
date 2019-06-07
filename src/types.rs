@@ -14,8 +14,8 @@ pub struct Oxy {
 #[derive(Default)]
 pub struct OxyDefault {
     pub done: bool,
-    pub portfwd_accepts: ArrayVec<[PortFwdAccept; 10]>,
-    pub portfwd_connects: ArrayVec<[PortFwdConnect; 10]>,
+    pub portfwd_accepts: ArrayVec<[PortFwdAccept; 128]>,
+    pub portfwd_connects: ArrayVec<[PortFwdConnect; 128]>,
     pub portfwd_connect_token_ticker: u16,
     pub portfwd_accept_token_ticker: u16,
     pub portfwd_bind_token_ticker: u16,
@@ -24,6 +24,7 @@ pub struct OxyDefault {
     pub outbound_nonce: Option<secretbox::Nonce>,
     pub inbound_nonce: Option<secretbox::Nonce>,
     pub recv_buffer: jcirclebuffer::CircleBuffer<Vec<u8>>,
+    pub send_buffer: jcirclebuffer::CircleBuffer<Vec<u8>>,
     pub message_buffer: jcirclebuffer::CircleBuffer<Vec<u8>>,
 }
 
@@ -179,4 +180,9 @@ impl std::str::FromStr for Mode {
             )),
         }
     }
+}
+
+pub enum PumpConnectionWriteResult {
+    Done,
+    KeepGoing,
 }
