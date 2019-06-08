@@ -17,13 +17,18 @@ impl Oxy {
                 .unwrap_or("")
                 .as_bytes(),
         );
+        let (remote_control_registration, remote_control_setreadiness) = mio::Registration::new2();
+        let poll = mio::Poll::new().expect("Failed to create poll");
+
         match &config.mode {
             Mode::Client => Oxy {
                 key,
                 connection,
                 config,
                 typedata: TypeData::Client(Default::default()),
-                poll: mio::Poll::new().unwrap(),
+                poll,
+                remote_control_registration,
+                remote_control_setreadiness,
                 d: Default::default(),
             },
             Mode::Server => Oxy {
@@ -31,7 +36,9 @@ impl Oxy {
                 connection,
                 config,
                 typedata: TypeData::Server(Default::default()),
-                poll: mio::Poll::new().unwrap(),
+                poll,
+                remote_control_registration,
+                remote_control_setreadiness,
                 d: Default::default(),
             },
         }

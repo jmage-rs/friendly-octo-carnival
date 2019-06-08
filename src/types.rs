@@ -1,6 +1,7 @@
 use arrayvec::{ArrayString, ArrayVec};
 use sodiumoxide::crypto::secretbox;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 pub struct Oxy {
     pub connection: mio::net::TcpStream,
@@ -8,6 +9,8 @@ pub struct Oxy {
     pub key: secretbox::Key,
     pub typedata: TypeData,
     pub poll: mio::Poll,
+    pub remote_control_registration: mio::Registration,
+    pub remote_control_setreadiness: mio::SetReadiness,
     pub d: OxyDefault,
 }
 
@@ -26,6 +29,11 @@ pub struct OxyDefault {
     pub recv_buffer: jcirclebuffer::CircleBuffer<Vec<u8>>,
     pub send_buffer: jcirclebuffer::CircleBuffer<Vec<u8>>,
     pub message_buffer: jcirclebuffer::CircleBuffer<Vec<u8>>,
+    pub remote_control_message_queue: Arc<Mutex<ArrayVec<[RemoteControlMessage; 32]>>>,
+}
+
+pub enum RemoteControlMessage {
+    MetaCommand(ArrayString<[u8; 256]>),
 }
 
 pub enum TypeData {
