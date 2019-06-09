@@ -17,30 +17,33 @@ impl Oxy {
                 .unwrap_or("")
                 .as_bytes(),
         );
-        let (remote_control_registration, remote_control_setreadiness) = mio::Registration::new2();
+        let (remote_control_from_oxy_registration, remote_control_from_oxy_setreadiness) =
+            mio::Registration::new2();
+        let (remote_control_to_oxy_registration, remote_control_to_oxy_setreadiness) =
+            mio::Registration::new2();
+        let (from_oxy_tx, from_oxy_rx) = std::sync::mpsc::sync_channel(32);
+        let (to_oxy_tx, to_oxy_rx) = std::sync::mpsc::sync_channel(32);
         let poll = mio::Poll::new().expect("Failed to create poll");
+        let mode = config.mode;
 
-        match &config.mode {
-            Mode::Client => Oxy {
-                key,
-                connection,
-                config,
-                typedata: TypeData::Client(Default::default()),
-                poll,
-                remote_control_registration,
-                remote_control_setreadiness,
-                d: Default::default(),
+        Oxy {
+            key,
+            connection,
+            config,
+            typedata: match mode {
+                Mode::Client => TypeData::Client(Default::default()),
+                Mode::Server => TypeData::Server(Default::default()),
             },
-            Mode::Server => Oxy {
-                key,
-                connection,
-                config,
-                typedata: TypeData::Server(Default::default()),
-                poll,
-                remote_control_registration,
-                remote_control_setreadiness,
-                d: Default::default(),
-            },
+            poll,
+            remote_control_from_oxy_registration: Some(remote_control_from_oxy_registration),
+            remote_control_from_oxy_setreadiness,
+            remote_control_to_oxy_registration,
+            remote_control_to_oxy_setreadiness,
+            remote_control_from_oxy_tx: from_oxy_tx,
+            remote_control_from_oxy_rx: Some(from_oxy_rx),
+            remote_control_to_oxy_tx: to_oxy_tx,
+            remote_control_to_oxy_rx: to_oxy_rx,
+            d: Default::default(),
         }
     }
 
@@ -370,6 +373,27 @@ impl Oxy {
         }
     }
 
+    pub fn take_remote_control(&mut self) -> RemoteControl {
+        let registration = self.remote_control_from_oxy_registration.take().unwrap();
+        let tx = self.remote_control_to_oxy_tx.clone();
+        let rx = self.remote_control_from_oxy_rx.take().unwrap();
+        let setreadiness = self.remote_control_to_oxy_setreadiness.clone();
+        RemoteControl {
+            registration,
+            tx,
+            rx,
+            setreadiness,
+        }
+    }
+
+    pub fn recv_remote_control(&mut self, message: &RemoteControlMessage) {
+        match message {
+            RemoteControlMessage::MetaCommand(command) => {
+                log::info!("Remote control message: {:?}", command);
+            }
+        }
+    }
+
     pub fn handle_readable_event(&mut self, event: mio::Event) {
         let category = event.token().0 & 0xFF000000;
         match category {
@@ -387,6 +411,11 @@ impl Oxy {
                         .try_recv()
                     {
                         self.handle_input(&input);
+                    }
+                }
+                REMOTE_CONTROL_TOKEN => {
+                    while let Ok(message) = self.remote_control_to_oxy_rx.try_recv() {
+                        self.recv_remote_control(&message);
                     }
                 }
                 _ => {
@@ -610,7 +639,7 @@ impl Oxy {
         message_id
     }
 
-    pub fn run(&mut self) {
+    pub fn init(&mut self) {
         sodiumoxide::init().unwrap();
         self.poll
             .register(
@@ -620,6 +649,18 @@ impl Oxy {
                 mio::PollOpt::edge(),
             )
             .unwrap();
+        self.poll
+            .register(
+                &self.remote_control_to_oxy_registration,
+                REMOTE_CONTROL_TOKEN,
+                mio::Ready::readable(),
+                mio::PollOpt::edge(),
+            )
+            .unwrap();
+    }
+
+    pub fn run(&mut self) {
+        self.init();
         let mut events = mio::Events::with_capacity(1024);
 
         match &self.config.mode {
