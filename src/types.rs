@@ -45,6 +45,7 @@ pub struct RemoteControl {
 
 pub enum RemoteControlMessage {
     MetaCommand(ArrayString<[u8; 256]>),
+    Callback(Box<FnOnce(&mut Oxy) + Send>),
 }
 
 pub enum TypeData {

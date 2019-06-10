@@ -2,7 +2,7 @@ use sodiumoxide::crypto::pwhash::argon2id13;
 use sodiumoxide::crypto::secretbox;
 use std::convert::TryInto;
 
-pub fn fatal<T, E>(result: &Result<T, E>, msg: &str)
+pub fn fatal<T, E>(result: Result<T, E>, msg: &str) -> T
 where
     E: std::fmt::Debug,
 {
@@ -11,7 +11,7 @@ where
             log::error!("{}: {:?}", msg, err);
             std::process::exit(1);
         }
-        _ => (),
+        Ok(x) => x,
     }
 }
 

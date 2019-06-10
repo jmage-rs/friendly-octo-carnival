@@ -386,10 +386,14 @@ impl Oxy {
         }
     }
 
-    pub fn recv_remote_control(&mut self, message: &RemoteControlMessage) {
+    pub fn recv_remote_control(&mut self, message: RemoteControlMessage) {
         match message {
             RemoteControlMessage::MetaCommand(command) => {
                 log::info!("Remote control message: {:?}", command);
+                self.handle_input(&command); // This is a temporary hack
+            }
+            RemoteControlMessage::Callback(callback) => {
+                callback(self);
             }
         }
     }
@@ -415,7 +419,7 @@ impl Oxy {
                 }
                 REMOTE_CONTROL_TOKEN => {
                     while let Ok(message) = self.remote_control_to_oxy_rx.try_recv() {
-                        self.recv_remote_control(&message);
+                        self.recv_remote_control(message);
                     }
                 }
                 _ => {
@@ -594,8 +598,7 @@ impl Oxy {
 
     pub fn spawn_readline_thread(&mut self) {
         let interface = linefeed::Interface::new("oxy");
-        fatal(&interface, "Failed to create linefeed interface");
-        let interface = interface.unwrap();
+        let interface = fatal(interface, "Failed to create linefeed interface");
         let _ = interface.set_prompt("oxy> ");
         let interface = Arc::new(interface);
         self.typedata.client_mut().linefeed_interface = Some(interface.clone());
