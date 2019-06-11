@@ -15,4 +15,4 @@ serde_derive = "1.0.91"
 linefeed = "0.6.0"
 sodiumoxide = "0.2.2"
 mio = "0.6.19"
-jcirclebuffer = { git = "https://github.com/jmage-rs/jcirclebuffer.git", rev = "1e81f481a95c48b9a53f2912e81b8dd9f8d4474b" }
+jcirclebuffer = { git = "https://github.com/jennamagius/jcirclebuffer.git", rev = "acbed5ce05ed0de494dad7a31864f4ead72025da" }

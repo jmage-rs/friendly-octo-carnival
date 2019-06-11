@@ -634,9 +634,9 @@ impl Oxy {
         self.d.outbound_message_ticker = self.d.outbound_message_ticker.checked_add(1).unwrap();
         let message = serde_cbor::to_vec(&message).unwrap();
         if let Some(nonce) = &mut self.d.outbound_nonce {
-            write_framed(&mut self.connection, &message, &self.key, nonce);
+            write_framed(&mut self.d.send_buffer, &message, &self.key, nonce);
         } else {
-            write_framed_explicit(&mut self.connection, &message, &self.key);
+            write_framed_explicit(&mut self.d.send_buffer, &message, &self.key);
         }
         log::debug!("Message sent successfully.");
         message_id
