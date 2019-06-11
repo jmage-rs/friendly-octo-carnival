@@ -362,6 +362,7 @@ impl Oxy {
             CATEGORY_BASE => match event.token() {
                 CONNECTION_TOKEN => {
                     self.pump_connection_write_multi();
+                    self.post_write_hooks();
                 }
                 _ => {
                     log::warn!("Unknown writable event: {:?}", event);
@@ -370,6 +371,17 @@ impl Oxy {
             _ => {
                 log::warn!("Unknown writable event: {:?}", event);
             }
+        }
+    }
+
+    pub fn post_write_hooks(&mut self) {
+        let accept_tokens: Vec<_> = self.d.portfwd_accepts.iter().map(|x| x.token).collect();
+        for token in accept_tokens {
+            self.pump_portfwd_multi(CATEGORY_PORTFWD_ACCEPT, token);
+        }
+        let connect_tokens: Vec<_> = self.d.portfwd_connects.iter().map(|x| x.token).collect();
+        for token in connect_tokens {
+            self.pump_portfwd_multi(CATEGORY_PORTFWD_CONNECT, token);
         }
     }
 
@@ -528,70 +540,96 @@ impl Oxy {
             },
             CATEGORY_PORTFWD_ACCEPT | CATEGORY_PORTFWD_CONNECT => {
                 let token = u16::try_from(event.token().0 & 0xFFFF).unwrap();
-                loop {
-                    let data = match category {
-                        CATEGORY_PORTFWD_ACCEPT => {
-                            self.d.portfwd_accepts.iter_mut().find(|x| x.token == token)
-                        }
-                        CATEGORY_PORTFWD_CONNECT => self
-                            .d
-                            .portfwd_connects
-                            .iter_mut()
-                            .find(|x| x.token == token),
-                        _ => unreachable!(),
-                    };
-                    if data.is_none() {
-                        log::warn!("Event for missing portfwd connect {:?}", event);
-                        return;
-                    }
-                    let data = data.unwrap();
-                    let mut read_buffer = ArrayVec::new();
-                    // This doesn't exist?? : read_buffer.resize(0, read_buffer.capacity());
-                    // This is totally eligible to just use unsafe { read_buffer.set_len() }, but...
-                    for _ in 0..read_buffer.capacity() {
-                        read_buffer.push(0);
-                    }
-                    let result = std::io::Read::read(&mut data.connection, &mut read_buffer);
-                    match result {
-                        Ok(amt) => {
-                            if amt == 0 {
-                                self.poll.deregister(&data.connection).unwrap();
-                                break;
-                            }
-                            read_buffer.truncate(amt);
-                            let message = Message::PortFwdData {
-                                reference: data.reference,
-                                direction: match (category, &self.config.mode) {
-                                    (CATEGORY_PORTFWD_ACCEPT, Mode::Client) => {
-                                        PortFwdDirection::LocalBind
-                                    }
-                                    (CATEGORY_PORTFWD_CONNECT, Mode::Client) => {
-                                        PortFwdDirection::RemoteBind
-                                    }
-                                    (CATEGORY_PORTFWD_ACCEPT, Mode::Server) => {
-                                        PortFwdDirection::RemoteBind
-                                    }
-                                    (CATEGORY_PORTFWD_CONNECT, Mode::Server) => {
-                                        PortFwdDirection::LocalBind
-                                    }
-                                    _ => unreachable!(),
-                                },
-                                data: read_buffer,
-                            };
-                            self.send_message(&message);
-                        }
-                        Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                            break;
-                        }
-                        Err(err) => {
-                            log::warn!("Unknown portfwd connect read error: {:?}", err);
-                            break;
-                        }
-                    }
-                }
+                self.pump_portfwd_multi(category, token);
             }
             _ => {
                 log::warn!("Unknown event category: {:?}", event);
+            }
+        }
+    }
+
+    pub fn pump_portfwd_single(
+        &mut self,
+        category: usize,
+        token: u16,
+    ) -> std::io::Result<RecvConnectionResult> {
+        // Strictly we only need ~1.06 message worth of space, but..
+        if self.d.send_buffer.available() < std::mem::size_of::<Message>() * 2 {
+            log::warn!("Write buffer full, holding off on portfwd shoveling");
+            return Ok(RecvConnectionResult::Full);
+        }
+        let forward = match category {
+            CATEGORY_PORTFWD_ACCEPT => self.d.portfwd_accepts.iter_mut().find(|x| x.token == token),
+            CATEGORY_PORTFWD_CONNECT => self
+                .d
+                .portfwd_connects
+                .iter_mut()
+                .find(|x| x.token == token),
+            _ => unreachable!(),
+        };
+        if forward.is_none() {
+            log::warn!(
+                "Event for missing portfwd connect {:?} {:?}",
+                category,
+                token
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "no such portfwd",
+            ));
+        }
+        let forward = forward.unwrap();
+        let mut buf = [0u8; 8192];
+        let result = std::io::Read::read(&mut forward.connection, &mut buf);
+        match result {
+            Ok(amt) => {
+                if amt == 0 {
+                    let _ = self.poll.deregister(&forward.connection);
+                    return Ok(RecvConnectionResult::Disconnected);
+                }
+                let message = CheapMessage::PortFwdData {
+                    reference: forward.reference,
+                    direction: match (category, &self.config.mode) {
+                        (CATEGORY_PORTFWD_ACCEPT, Mode::Client) => PortFwdDirection::LocalBind,
+                        (CATEGORY_PORTFWD_CONNECT, Mode::Client) => PortFwdDirection::RemoteBind,
+                        (CATEGORY_PORTFWD_ACCEPT, Mode::Server) => PortFwdDirection::RemoteBind,
+                        (CATEGORY_PORTFWD_CONNECT, Mode::Server) => PortFwdDirection::LocalBind,
+                        _ => unreachable!(),
+                    },
+                    data: &buf[..amt],
+                };
+                self.send_message(&message);
+                Ok(RecvConnectionResult::KeepGoing)
+            }
+            Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                Ok(RecvConnectionResult::WouldBlock)
+            }
+            Err(err) => {
+                log::warn!("Unknown portfwd connect read error: {:?}", err);
+                Err(err)
+            }
+        }
+    }
+
+    pub fn pump_portfwd_multi(&mut self, category: usize, token: u16) {
+        loop {
+            match self.pump_portfwd_single(category, token) {
+                Ok(RecvConnectionResult::Full) => {
+                    break;
+                }
+                Ok(RecvConnectionResult::WouldBlock) => {
+                    break;
+                }
+                Ok(RecvConnectionResult::KeepGoing) => {
+                    continue;
+                }
+                Ok(RecvConnectionResult::Disconnected) => {
+                    // TODO
+                    break;
+                }
+                Err(_) => {
+                    break;
+                }
             }
         }
     }
@@ -629,7 +667,7 @@ impl Oxy {
         });
     }
 
-    pub fn send_message(&mut self, message: &Message) -> u64 {
+    pub fn send_message(&mut self, message: &impl serde::Serialize) -> u64 {
         let message_id = self.d.outbound_message_ticker;
         self.d.outbound_message_ticker = self.d.outbound_message_ticker.checked_add(1).unwrap();
         let message = serde_cbor::to_vec(&message).unwrap();

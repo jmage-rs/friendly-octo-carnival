@@ -181,6 +181,36 @@ pub enum Message {
     },
 }
 
+#[derive(serde_derive::Serialize)]
+pub enum CheapMessage<'a> {
+    NonceUpdate {
+        client_send: [u8; 24],
+        client_recv: [u8; 24],
+    },
+    Reject {
+        reference: u64,
+        message: ArrayString<[u8; 8192]>,
+    },
+    Command {
+        command: ArrayVec<[u8; 8192]>,
+    },
+    Output {
+        reference: u64,
+        output: ArrayVec<[u8; 8192]>,
+    },
+    PortFwdBind {
+        addr: std::net::SocketAddr,
+    },
+    PortFwdConnect {
+        reference: u64,
+    },
+    PortFwdData {
+        reference: u64,
+        direction: PortFwdDirection,
+        data: &'a [u8],
+    },
+}
+
 #[derive(PartialEq, serde_derive::Serialize, serde_derive::Deserialize, Debug)]
 pub enum PortFwdDirection {
     RemoteBind,

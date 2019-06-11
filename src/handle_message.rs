@@ -3,6 +3,7 @@ use sodiumoxide::crypto::secretbox;
 
 use crate::constants::*;
 use crate::types::*;
+use crate::util::blocking_write_all;
 
 impl Oxy {
     pub(crate) fn handle_message(&mut self, message: &Message, message_number: u64) {
@@ -164,7 +165,7 @@ impl Oxy {
                             .iter_mut()
                             .find(|x| x.reference == *reference)
                             .unwrap();
-                        std::io::Write::write_all(&mut connection_data.connection, &data).unwrap();
+                        blocking_write_all(&mut connection_data.connection, &data).unwrap();
                     }
                     (Mode::Client, PortFwdDirection::RemoteBind) => {
                         let connection_data = self
@@ -173,7 +174,7 @@ impl Oxy {
                             .iter_mut()
                             .find(|x| x.reference == *reference)
                             .unwrap();
-                        std::io::Write::write_all(&mut connection_data.connection, &data).unwrap();
+                        blocking_write_all(&mut connection_data.connection, &data).unwrap();
                     }
                     (Mode::Server, PortFwdDirection::LocalBind) => {
                         let connection_data = self
@@ -182,7 +183,7 @@ impl Oxy {
                             .iter_mut()
                             .find(|x| x.reference == *reference)
                             .unwrap();
-                        std::io::Write::write_all(&mut connection_data.connection, &data).unwrap();
+                        blocking_write_all(&mut connection_data.connection, &data).unwrap();
                     }
                     (Mode::Client, PortFwdDirection::LocalBind) => {
                         let connection_data = self
@@ -191,7 +192,7 @@ impl Oxy {
                             .iter_mut()
                             .find(|x| x.reference == *reference)
                             .unwrap();
-                        std::io::Write::write_all(&mut connection_data.connection, &data).unwrap();
+                        blocking_write_all(&mut connection_data.connection, &data).unwrap();
                     }
                 };
             }

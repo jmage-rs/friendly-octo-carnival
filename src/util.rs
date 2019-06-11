@@ -15,6 +15,34 @@ where
     }
 }
 
+pub fn blocking_write_all(
+    connection: &mut impl std::io::Write,
+    data: &[u8],
+) -> std::io::Result<usize> {
+    let mut accum = 0;
+    while accum < data.len() {
+        let result = std::io::Write::write(connection, &data[accum..]);
+        match result {
+            Ok(x) => {
+                assert!(x != 0);
+                accum += x;
+            }
+            Err(ref err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                continue;
+            }
+            Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::yield_now();
+                continue;
+            }
+            Err(x) => {
+                return Err(x);
+            }
+        }
+    }
+    assert!(accum == data.len());
+    Ok(accum)
+}
+
 pub fn write_framed_explicit(w: &mut impl std::io::Write, message: &[u8], key: &secretbox::Key) {
     let mut framer = MessageFramer::frame(&message);
     while let Some(frame) = framer.next() {
